@@ -35,6 +35,13 @@ EDITION_OPTIONS = [
     "別版・その他"
 ]
 
+TYPE_COLOR_MAP = {
+    "漫画": "background-color: #E8F0FE; color: #1F1F1F;",
+    "小説": "background-color: #E6F4EA; color: #1F1F1F;",
+    "ボイス/ASMR": "background-color: #FCE8E6; color: #1F1F1F;",
+    "ゲーム": "background-color: #FEF7E0; color: #1F1F1F;",
+}
+
 GAS_URL = st.secrets.get("GAS_URL", "")
 
 if not GAS_URL:
@@ -79,13 +86,11 @@ def parse_volume_tokens(vol_str):
     s = str(vol_str).strip()
     if not s:
         return [], []
-    # 区切り文字で分割
     raw_tokens = [tok.strip() for tok in re.split(r"[,、\s/／]+", s) if tok.strip()]
     expanded = []
     multi_spec_vols = []
 
     for tok in raw_tokens:
-        # 7(通常+特装) のような明示的な二重所持表記
         if re.search(r"(\+|＋|＆|&|両方|二重)", tok):
             m_num = re.match(r"^(\d+(?:\.\d+)?)", tok)
             v_label = m_num.group(1) if m_num else tok
@@ -93,7 +98,6 @@ def parse_volume_tokens(vol_str):
             expanded.append(v_label)
             continue
 
-        # 範囲表記（例: 24〜30, 1-5, 1~10）
         m_range = re.match(r"^(\d+)\s*[〜~\-－]\s*(\d+)", tok)
         if m_range:
             start_v, end_v = int(m_range.group(1)), int(m_range.group(2))
@@ -104,11 +108,9 @@ def parse_volume_tokens(vol_str):
                 expanded.append(tok)
             continue
 
-        # 単一巻＋仕様メモ（例: 7(特装), 3(FC), 11特）
         m_single = re.match(r"^(\d+(?:\.\d+)?)(.*)$", tok)
         if m_single:
             num_part = m_single.group(1)
-            suffix_part = m_single.group(2).strip()
             expanded.append(num_part)
             continue
 
@@ -136,16 +138,13 @@ def detect_all_dual_owned(df):
         ed = str(row["版・仕様"]).strip()
         vol_str = str(row["所持巻数"]).strip()
 
-        # 1. 別行で同じベースタイトルが複数登録されている（通常版と文庫版、通常版と特装版など）
         if bt and title_counts[bt] >= 2:
             other_editions = df[base_titles == bt]["版・仕様"].tolist()
             reasons.append(f"別行で複数版登録あり（{' / '.join(other_editions)}）")
 
-        # 2. 版・仕様カラム自体が二重所持（「通常＋特装版」など）になっている
         if "＋" in ed or "+" in ed or "二重" in ed:
             reasons.append(f"仕様欄で二重所持（{ed}）")
 
-        # 3. 所持巻数欄の中に同一巻の重複や複数仕様（例: 1〜10, 7(特装) や 4 4 4）がある
         _, dup_vols = parse_volume_tokens(vol_str)
         if dup_vols:
             reasons.append(f"巻数重複・別仕様あり（{', '.join(dup_vols)}）")
@@ -279,6 +278,12 @@ def fetch_dlsite_info(rj_id):
         "備考": ""
     }
 
+def style_by_type(df_to_style):
+    def row_style(row):
+        style_str = TYPE_COLOR_MAP.get(str(row.get("種別", "")).strip(), "")
+        return [style_str] * len(row)
+    return df_to_style.style.apply(row_style, axis=1)
+
 df = load_data()
 dual_owned_map = detect_all_dual_owned(df)
 
@@ -306,7 +311,11 @@ with tab1:
         plat_list = ["すべて"] + sorted([x for x in df["購入元"].unique() if x])
         platform_filter = st.selectbox("購入元で絞り込み", plat_list)
 
-    only_dual = st.checkbox(f"⚠️ 既に二重所持（通常＋特装版／別版／重複巻）している作品のみ表示（現在 {len(dual_owned_map)} 件該当）")
+    col_chk1, col_chk2 = st.columns([2, 1])
+    with col_chk1:
+        only_dual = st.checkbox(f"⚠️ 既に二重所持（通常＋特装版／別版／重複巻）している作品のみ表示（現在 {len(dual_owned_map)} 件該当）")
+    with col_chk2:
+        use_color = st.checkbox("🎨 種別ごとに色分け表示（漫画=青 / 小説=緑 / ボイス=桃）", value=True)
 
     filtered_df = df.copy()
     if only_dual:
@@ -334,7 +343,10 @@ with tab1:
         filtered_df = filtered_df[filtered_df["購入元"] == platform_filter]
 
     st.write(f"表示件数: **{len(filtered_df)}** 件 / 全 **{len(df)}** 件")
-    st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+    if use_color and not filtered_df.empty:
+        st.dataframe(style_by_type(filtered_df), use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
 
 with tab2:
     st.subheader("作品の1件登録")
