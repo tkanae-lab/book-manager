@@ -23,6 +23,8 @@ COLUMNS = [
     "備考"
 ]
 
+MEDIA_TYPES = ["漫画", "小説", "ボイス/ASMR", "ゲーム", "その他"]
+
 EDITION_OPTIONS = [
     "通常",
     "特装版・限定版",
@@ -34,6 +36,8 @@ EDITION_OPTIONS = [
     "通常＋セミカラー（二重所持）",
     "別版・その他"
 ]
+
+PLATFORM_OPTIONS = ["DLsite", "Amazon", "FANZA", "DMM", "BOOTH", "その他"]
 
 TYPE_COLOR_MAP = {
     "漫画": "background-color: #E8F0FE; color: #1F1F1F;",
@@ -72,10 +76,23 @@ def add_row(row_dict):
     return res.json()
 
 def normalize_base_title(title):
+    """タイトルから【特装版】【フルカラー】や末尾の省略記号（... / …）を取り除いたベース作品名を返す"""
     t = str(title).strip()
     t = re.sub(r"[\[【\(（].*?(特装|限定|フルカラー|セミカラー|カラー|デジタル版|文庫|新装|愛蔵|完全版).*?[\]】\)）]", "", t)
     t = re.sub(r"\s*(特装版|限定版|フルカラー版?|セミカラー版?|文庫版|新装版|愛蔵版|完全版)$", "", t)
+    t = re.sub(r"(\.{2,}|…+)$", "", t)
     return t.strip()
+
+def detect_edition_from_title(title_str):
+    if "フルカラー" in title_str or "極彩色" in title_str:
+        return "フルカラー"
+    if "セミカラー" in title_str:
+        return "セミカラー"
+    if "特装版" in title_str or "限定版" in title_str:
+        return "特装版・限定版"
+    if "文庫" in title_str or "新装版" in title_str or "愛蔵版" in title_str:
+        return "文庫・新装版"
+    return "通常"
 
 def parse_volume_tokens(vol_str):
     s = str(vol_str).strip()
@@ -166,7 +183,11 @@ def check_duplicates(df, item_id, title, edition, volumes):
             row_vols_str = str(row["所持巻数"]).strip()
             row_vols, _ = parse_volume_tokens(row_vols_str)
 
-            if base_input and row_base and (base_input.lower() == row_base.lower() or base_input.lower() in row_base.lower() or row_base.lower() in base_input.lower()):
+            if base_input and row_base and (
+                base_input.lower() == row_base.lower()
+                or (len(base_input) >= 4 and base_input.lower() in row_base.lower())
+                or (len(row_base) >= 4 and row_base.lower() in base_input.lower())
+            ):
                 overlap_vols = sorted(set(new_vols) & set(row_vols))
                 if row_ed != edition:
                     warnings.append(
@@ -227,14 +248,7 @@ def fetch_dlsite_info(rj_id):
                     else:
                         media_type = "ボイス/ASMR" if cvs else "その他"
 
-                    edition = "通常"
-                    if "フルカラー" in title:
-                        edition = "フルカラー"
-                    elif "セミカラー" in title:
-                        edition = "セミカラー"
-                    elif "特装版" in title or "限定版" in title:
-                        edition = "特装版・限定版"
-
+                    edition = detect_edition_from_title(title)
                     creator_str = " / ".join(authors) if authors else maker
 
                     return {
@@ -281,22 +295,111 @@ def compress_int_volumes(nums):
     ranges.append(f"{start}〜{prev}" if start != prev else f"{start}")
     return ", ".join(ranges)
 
+def classify_dlsite_type(tag_text):
+    if any(k in tag_text for k in ["ボイス", "ASMR", "音楽", "音素材", "音声"]):
+        return "ボイス/ASMR"
+    if any(k in tag_text for k in ["ノベル", "小説", "文芸", "ラノベ"]):
+        return "小説"
+    if any(k in tag_text for k in ["ゲーム", "ロールプレイング", "シミュレーション", "アクション", "アドベンチャー", "シューティング", "パズル", "クイズ", "テーブル", "タイピング"]):
+        return "ゲーム"
+    if any(k in tag_text for k in ["動画", "アニメ", "ツール"]):
+        return "その他"
+    return "漫画"
+
+def consolidate_series_rows(raw_items, platform_name):
+    """抽出した作品リストから同一シリーズの巻数（（1）〜（4）等）を自動で1行にまとめる"""
+    vol_suffix_pat = re.compile(r"^(.*?)(?:[\s　]*[第\(（【\[巻]*(\d+)[\)）】\]巻]*)$")
+    grouped = {}
+    order_keys = []
+
+    for it in raw_items:
+        t = it["title"].strip()
+        t_norm = t.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+        m_vol = vol_suffix_pat.match(t_norm)
+        if m_vol and not it.get("owned_cnt") and m_vol.group(1).strip():
+            base_t = m_vol.group(1).strip()
+            v_num = int(m_vol.group(2))
+            key = (base_t, it["maker"], it["mtype"])
+            if key not in grouped:
+                grouped[key] = {"vols": [], "date": it["date"], "owned_cnt": None, "total_cnt": None, "extra_note": it.get("note", "")}
+                order_keys.append(key)
+            grouped[key]["vols"].append(v_num)
+        else:
+            key = (t, it["maker"], it["mtype"], len(order_keys))
+            grouped[key] = {
+                "vols": [],
+                "date": it["date"],
+                "owned_cnt": it.get("owned_cnt"),
+                "total_cnt": it.get("total_cnt"),
+                "exact_title": t,
+                "extra_note": it.get("note", "")
+            }
+            order_keys.append(key)
+
+    final_rows = []
+    for key in order_keys:
+        g = grouped[key]
+        title_out = g.get("exact_title", key[0])
+        maker_out = key[1]
+        mtype_out = key[2]
+
+        notes = []
+        if g.get("extra_note"):
+            notes.append(g["extra_note"])
+        if title_out.endswith("...") or title_out.endswith("…"):
+            notes.append("※タイトル末尾省略あり")
+
+        if g["vols"]:
+            vol_str = compress_int_volumes(g["vols"])
+        elif g.get("owned_cnt"):
+            vol_str = f"計{g['owned_cnt']}冊（巻数未展開）"
+            notes.append(f"Play集約({g['owned_cnt']}/{g['total_cnt']})")
+        else:
+            vol_str = ""
+
+        edition = detect_edition_from_title(title_out)
+
+        final_rows.append({
+            "固有ID": "",
+            "タイトル": title_out,
+            "種別": mtype_out,
+            "版・仕様": edition,
+            "所持巻数": vol_str,
+            "完結": "",
+            "作者・サークル": maker_out,
+            "CV・出演者": "",
+            "購入元": platform_name,
+            "購入日": g["date"],
+            "備考": " / ".join(notes)
+        })
+    return final_rows
+
 def parse_dlsite_copied_text(text, fallback_date):
-    """
-    DLsiteの画面（購入履歴テーブル、DLsite Play本棚など）から丸ごとコピーしたテキストを
-    自動判定・解析し、不要な表ヘッダーやボタン文字をカットしてシリーズごとに巻数を集約する
-    """
+    """DLsiteの購入履歴テーブルまたはDLsite Play本棚の全選択コピーを自動解析する"""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
         return []
 
     userbuy_date_pat = re.compile(r"^(\d{4})/(\d{1,2})/(\d{1,2})(?:\s+(\d{1,2}:\d{1,2}))?")
     play_date_pat = re.compile(r"^(\d{4})年(\d{1,2})月(\d{1,2})日\s*購入")
-    meta_pat = re.compile(r"^(?:(\d+)/(\d+)作品)?(マンガ・CG|ボイス・ASMR|ノベル|ゲーム|動画|音楽|ツール|その他)?$")
+    meta_pat = re.compile(r"^(?:(\d+)/(\d+)作品)?.*?(マンガ・CG|ボイス・ASMR|ノベル|ゲーム|動画|音楽|ツール|その他).*?$")
+    only_count_pat = re.compile(r"^(\d+)/(\d+)作品$")
+
+    tag_keywords = [
+        "全年齢", "R-18", "R15", "成人向け", "マンガ", "単行本", "雑誌", "WEBマンガ",
+        "劇画", "CG・イラスト", "CG", "ボイス・ASMR", "ボイス", "ASMR", "音楽", "音素材",
+        "ノベル", "小説", "デジタルノベル", "ロールプレイング", "シミュレーション",
+        "アクション", "アドベンチャー", "シューティング", "パズル", "クイズ", "テーブル",
+        "タイピング", "その他ゲーム", "ゲーム", "動画", "ツール"
+    ]
+    junk_keywords = [
+        "視聴", "DL", "ダウンロード", "ブラウザ", "評価する", "評価済", "レビュー",
+        "全額ポイント", "ポイント", "クレジット", "円", "購入日時", "アフィリエイト"
+    ]
 
     raw_items = []
 
-    # パターン1: 購入履歴テーブル（2026/08/24 02:01 形式の日付を含むテーブル）
+    # パターン1: 購入履歴テーブル（2026/08/24 02:01 形式）
     if any(userbuy_date_pat.match(l) for l in lines):
         i = 0
         while i < len(lines):
@@ -307,24 +410,19 @@ def parse_dlsite_copied_text(text, fallback_date):
                 if i + 1 < len(lines):
                     title = lines[i+1]
                     maker = ""
-                    cat_str = ""
-                    for j in range(i+2, min(i+6, len(lines))):
+                    collected_tags = []
+                    for j in range(i + 2, min(i + 8, len(lines))):
                         sub_l = lines[j]
                         if userbuy_date_pat.match(sub_l):
                             break
-                        if any(k in sub_l for k in ["全年齢", "R-18", "マンガ", "ボイス", "ノベル", "ゲーム"]):
-                            cat_str = sub_l
-                        elif not maker and not any(k in sub_l for k in ["視聴", "評価", "ポイント", "円", "クレジット", "-"]):
+                        if sub_l == "-" or any(jk in sub_l for jk in junk_keywords):
+                            continue
+                        if any(tk in sub_l for tk in tag_keywords):
+                            collected_tags.append(sub_l)
+                        elif not maker:
                             maker = sub_l
 
-                    mtype = "漫画"
-                    if "ボイス" in cat_str or "ASMR" in cat_str or "音" in cat_str:
-                        mtype = "ボイス/ASMR"
-                    elif "ノベル" in cat_str or "小説" in cat_str:
-                        mtype = "小説"
-                    elif "ゲーム" in cat_str:
-                        mtype = "ゲーム"
-
+                    mtype = classify_dlsite_type(" ".join(collected_tags))
                     raw_items.append({
                         "title": title,
                         "maker": maker,
@@ -347,10 +445,11 @@ def parse_dlsite_copied_text(text, fallback_date):
                 continue
 
             m_meta = meta_pat.match(line)
-            if m_meta and (m_meta.group(1) or m_meta.group(3)):
-                owned_cnt = m_meta.group(1)
-                total_cnt = m_meta.group(2)
-                cat_str = m_meta.group(3) or ""
+            m_cnt = only_count_pat.match(line)
+            if m_meta or m_cnt:
+                owned_cnt = m_meta.group(1) if m_meta else m_cnt.group(1)
+                total_cnt = m_meta.group(2) if m_meta else m_cnt.group(2)
+                cat_str = m_meta.group(3) if m_meta else "マンガ・CG"
                 if len(buffer) >= 2:
                     t_val = buffer[-2]
                     m_val = buffer[-1]
@@ -360,15 +459,7 @@ def parse_dlsite_copied_text(text, fallback_date):
                 else:
                     continue
 
-                if "ボイス" in cat_str or "ASMR" in cat_str or "音" in cat_str:
-                    mtype = "ボイス/ASMR"
-                elif "ノベル" in cat_str:
-                    mtype = "小説"
-                elif "ゲーム" in cat_str:
-                    mtype = "ゲーム"
-                else:
-                    mtype = "漫画"
-
+                mtype = classify_dlsite_type(cat_str)
                 raw_items.append({
                     "title": t_val,
                     "maker": m_val,
@@ -383,72 +474,194 @@ def parse_dlsite_copied_text(text, fallback_date):
 
     if not raw_items:
         return []
+    return consolidate_series_rows(raw_items, "DLsite")
 
-    # タイトル末尾の巻数（例: （４）, (3), 　８, 7巻 等）を自動抽出し、シリーズ単位でまとめる
-    vol_suffix_pat = re.compile(r"^(.*?)(?:[\s　]*[第\(（【\[巻]*(\d+)[\)）】\]巻]*)$")
+def parse_fanza_dmm_text(text, fallback_date, platform_name="FANZA"):
+    """FANZA / DMMの購入済み一覧テキスト（日付＋種別＋タイトル＋サークル/著者）を自動解析する"""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return []
+
+    date_pat = re.compile(r"^(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})日?(?:\s*購入)?")
+    cat_map = {
+        "コミック": "漫画",
+        "マンガ": "漫画",
+        "マンガ・CG": "漫画",
+        "同人誌": "漫画",
+        "単行本": "漫画",
+        "雑誌": "漫画",
+        "CG": "漫画",
+        "CG（イラスト）": "漫画",
+        "CG・イラスト": "漫画",
+        "ボイス": "ボイス/ASMR",
+        "ボイス・ASMR": "ボイス/ASMR",
+        "音声": "ボイス/ASMR",
+        "音楽": "ボイス/ASMR",
+        "ASMR": "ボイス/ASMR",
+        "ノベル": "小説",
+        "小説": "小説",
+        "文芸・ラノベ": "小説",
+        "ライトノベル": "小説",
+        "ビジネス・実用": "小説",
+        "ゲーム": "ゲーム",
+        "動画": "その他",
+        "アニメ": "その他",
+        "アダルトアニメ": "その他",
+        "写真集": "その他",
+    }
+    junk_words = {
+        "ダウンロード", "ブラウザで読む", "ブラウザ視聴", "視聴する", "再生",
+        "レビューを書く", "評価する", "お気に入り", "バスケット", "購入済み作品",
+        "一覧", "新着順", "購入日順"
+    }
+
+    current_date = fallback_date
+    raw_items = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m_date = date_pat.match(line)
+        if m_date:
+            current_date = f"{int(m_date.group(1)):04d}/{int(m_date.group(2)):02d}/{int(m_date.group(3)):02d}"
+            i += 1
+            continue
+
+        if line in cat_map:
+            mtype = cat_map[line]
+            title = ""
+            maker = ""
+            j = i + 1
+            while j < len(lines):
+                cand = lines[j]
+                if date_pat.match(cand) or cand in cat_map:
+                    break
+                if cand in junk_words or re.match(r"^\d+[,，]?\d*円$", cand):
+                    j += 1
+                    continue
+                if not title:
+                    title = cand
+                elif not maker:
+                    maker = cand
+                    j += 1
+                    break
+                j += 1
+            if title:
+                raw_items.append({
+                    "title": title,
+                    "maker": maker,
+                    "mtype": mtype,
+                    "date": current_date
+                })
+            i = j
+            continue
+        i += 1
+
+    if not raw_items:
+        return []
+    return consolidate_series_rows(raw_items, platform_name)
+
+def parse_amazon_kindle_text(text, fallback_type="漫画"):
+    """Amazonの『コンテンツと端末の管理』の全選択コピーを自動解析して巻数をまとめる"""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return []
+
+    date_pat = re.compile(r"^(?:取得日|購入日|注文日)[:：]\s*(\d{4})年(\d{1,2})月(\d{1,2})日")
+    junk_patterns = [
+        "デバイスからの配信または削除", "削除", "その他のアクション",
+        "デバイスに配信", "既読としてマーク", "未読としてマーク",
+        "コレクションに追加する", "すべて選択する", "すべての選択を解除",
+        "表示:", "並べ替え:", "コンテンツを検索", "進む"
+    ]
+
+    raw_items = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m_date = date_pat.search(line)
+        if m_date:
+            d_str = f"{int(m_date.group(1)):04d}/{int(m_date.group(2)):02d}/{int(m_date.group(3)):02d}"
+            candidates = []
+            for back_idx in range(i - 1, max(-1, i - 5), -1):
+                prev_line = lines[back_idx]
+                if any(j in prev_line for j in junk_patterns) or date_pat.search(prev_line):
+                    break
+                candidates.insert(0, prev_line)
+
+            if len(candidates) >= 2:
+                title = candidates[0]
+                author = candidates[1]
+            elif len(candidates) == 1:
+                title = candidates[0]
+                author = ""
+            else:
+                title = ""
+                author = ""
+
+            if title:
+                raw_items.append({
+                    "title": title,
+                    "author": author,
+                    "date": d_str
+                })
+        i += 1
+
     grouped = {}
     order_keys = []
 
     for it in raw_items:
         t = it["title"].strip()
-        t_norm = t.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
-        m_vol = vol_suffix_pat.match(t_norm)
-        if m_vol and not it.get("owned_cnt") and m_vol.group(1).strip():
-            base_t = m_vol.group(1).strip()
-            v_num = int(m_vol.group(2))
-            key = (base_t, it["maker"], it["mtype"])
+        t_norm = t.translate(str.maketrans("０１２３４５６７８９（）", "0123456789()"))
+
+        m_vol = re.search(r"[\(（](\d+)[\)）]", t_norm)
+        v_num = None
+        if m_vol:
+            v_num = int(m_vol.group(1))
+            base_t = (t_norm[:m_vol.start()] + t_norm[m_vol.end():]).strip()
+        else:
+            m_vol2 = re.search(r"(\d+)\s*巻", t_norm)
+            if m_vol2:
+                v_num = int(m_vol2.group(1))
+                base_t = (t_norm[:m_vol2.start()] + t_norm[m_vol2.end():]).strip()
+            else:
+                base_t = t_norm
+
+        label_match = re.search(r"[\(（](.+?Web|.+?コミックス|.+?文庫|.+?レーベル)[\)）]", base_t, re.IGNORECASE)
+        label_str = ""
+        if label_match:
+            label_str = label_match.group(1)
+            base_t = (base_t[:label_match.start()] + base_t[label_match.end():]).strip()
+
+        if v_num is not None:
+            key = (base_t, it["author"])
             if key not in grouped:
-                grouped[key] = {"vols": [], "date": it["date"], "owned_cnt": None, "total_cnt": None}
+                grouped[key] = {"vols": [], "date": it["date"], "label": label_str}
                 order_keys.append(key)
             grouped[key]["vols"].append(v_num)
         else:
-            key = (t, it["maker"], it["mtype"], len(order_keys))
-            grouped[key] = {
-                "vols": [],
-                "date": it["date"],
-                "owned_cnt": it.get("owned_cnt"),
-                "total_cnt": it.get("total_cnt"),
-                "exact_title": t
-            }
+            key = (base_t, it["author"], len(order_keys))
+            grouped[key] = {"vols": [], "date": it["date"], "label": label_str, "exact_title": base_t}
             order_keys.append(key)
 
     final_rows = []
     for key in order_keys:
         g = grouped[key]
         title_out = g.get("exact_title", key[0])
-        maker_out = key[1]
-        mtype_out = key[2]
-
-        if g["vols"]:
-            vol_str = compress_int_volumes(g["vols"])
-            note_str = ""
-        elif g.get("owned_cnt"):
-            vol_str = f"計{g['owned_cnt']}冊（巻数未展開）"
-            note_str = f"DLsite Play集約表示({g['owned_cnt']}/{g['total_cnt']})"
-        else:
-            vol_str = ""
-            note_str = ""
-
-        edition = "通常"
-        if "フルカラー" in title_out:
-            edition = "フルカラー"
-        elif "セミカラー" in title_out:
-            edition = "セミカラー"
-        elif "特装版" in title_out or "限定版" in title_out:
-            edition = "特装版・限定版"
-
+        author_out = key[1]
+        v_str = compress_int_volumes(g["vols"]) if g["vols"] else ""
+        edition = detect_edition_from_title(title_out)
         final_rows.append({
             "固有ID": "",
             "タイトル": title_out,
-            "種別": mtype_out,
+            "種別": fallback_type,
             "版・仕様": edition,
-            "所持巻数": vol_str,
+            "所持巻数": v_str,
             "完結": "",
-            "作者・サークル": maker_out,
+            "作者・サークル": author_out,
             "CV・出演者": "",
-            "購入元": "DLsite",
+            "購入元": "Amazon",
             "購入日": g["date"],
-            "備考": note_str
+            "備考": g["label"]
         })
     return final_rows
 
@@ -528,7 +741,7 @@ with tab2:
     with st.form("register_form", clear_on_submit=False):
         col1, col2 = st.columns(2)
         with col1:
-            media_type = st.selectbox("種別", ["漫画", "小説", "ボイス/ASMR", "ゲーム", "その他"])
+            media_type = st.selectbox("種別", MEDIA_TYPES)
             edition = st.selectbox("版・仕様", EDITION_OPTIONS)
             item_id = st.text_input("固有ID（RJ番号 / ISBN / ASIN）", placeholder="例: RJ123456")
             title = st.text_input("タイトル *", placeholder="作品名を入力")
@@ -537,7 +750,7 @@ with tab2:
             completed = st.selectbox("完結ステータス", ["", "★（完結）", "☆（一時完結・区切り）"])
             creator = st.text_input("作者・サークル名")
             cv = st.text_input("CV・出演者", placeholder="声優名など（複数可）")
-            platform = st.selectbox("購入元", ["DLsite", "Amazon", "FANZA", "DMM", "BOOTH", "その他"])
+            platform = st.selectbox("購入元", PLATFORM_OPTIONS)
             purchase_date = st.date_input("購入日", value=date.today())
             note = st.text_input("備考", placeholder="レーベル略称（JC, KC等）・セール情報・特典メモなど")
 
@@ -582,24 +795,28 @@ with tab2:
 
 with tab3:
     st.subheader("📦 まとめて一括登録")
-    st.caption("DLsiteの購入履歴（全選択コピー）・RJ番号・DLsite Play本棚、またはAmazon等のタイトル一覧からまとめて一括登録できます。")
+    st.caption("サイトごとに画面を丸ごとコピー（Ctrl+A -> Ctrl+C）して貼り付けるだけで、不要なボタンや文字を除去してシリーズ巻数を自動で集約します。")
 
     if "bulk_df" not in st.session_state:
         st.session_state.bulk_df = pd.DataFrame(columns=COLUMNS)
 
-    sub_a, sub_b = st.tabs(["🎧 方法A：DLsite（購入履歴丸ごとコピー / RJ番号）から自動取得", "📖 方法B：タイトル一覧テキストから一括作成"])
+    sub_a, sub_b, sub_c, sub_d = st.tabs([
+        "🎧 方法A：DLsite（購入履歴 / 本棚）",
+        "🔞 方法B：FANZA / DMM（購入済み一覧）",
+        "📦 方法C：Amazon Kindle（コンテンツ管理）",
+        "✍️ 方法D：手入力・その他（1行1作品）"
+    ])
 
     with sub_a:
         rj_text = st.text_area(
-            "DLsiteの購入履歴画面（Ctrl+Aで丸ごとコピーしたもの）、またはRJ/BJ番号リストをそのまま貼り付け",
-            placeholder="・購入履歴ページの画面全体（Ctrl+A -> Ctrl+C）をそのまま貼り付けOK！\n（『購入日時』『評価する』『全額ポイント』などの不要な表文字は自動で全削除し、作品名と巻数を抽出します）\n・R-18作品もフィルターなしで完全に自動取得されます。",
+            "DLsiteの購入履歴画面（Ctrl+Aで丸ごとコピーしたもの）、またはRJ/BJ番号リストを貼り付け",
+            placeholder="・購入履歴ページの画面全体（Ctrl+A -> Ctrl+C）をそのまま貼り付けOK！\n・マンガ、ボイス・ASMR、ノベル、ゲームすべて自動判別し、同一シリーズの巻数も自動で『1〜4』のように集約します。",
             height=140
         )
         col_d1, col_d2 = st.columns([1, 2])
         with col_d1:
             dlsite_date = st.date_input("購入日（日付が取得できない場合用）", value=date.today(), key="dl_date")
         if st.button("① DLsiteテキストから作品・巻数情報を自動抽出"):
-            # 1. まずRJ/BJ番号単体のリストがあるか判定
             codes = list(dict.fromkeys(re.findall(r"[RVB]J\d{6,8}", rj_text.upper())))
             if codes:
                 existing_ids = set(df["固有ID"].str.strip().str.upper())
@@ -621,22 +838,57 @@ with tab3:
                     st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(new_rows)], ignore_index=True)
                     st.success(f"{len(new_rows)}件の作品情報を下のプレビュー表に追加しました！")
             else:
-                # 2. 購入履歴テーブルまたはDLsite Play本棚の丸ごとコピペを自動解析
                 parsed_rows = parse_dlsite_copied_text(rj_text, dlsite_date.strftime("%Y/%m/%d"))
                 if parsed_rows:
                     st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(parsed_rows)], ignore_index=True)
-                    st.success(f"購入履歴テーブルから不要な文字を除去し、{len(parsed_rows)} 件のシリーズ（同一作品の巻数を統合）をプレビュー表に追加しました！")
+                    st.success(f"DLsiteのテキストから不要文字を除去し、{len(parsed_rows)} 件のシリーズをプレビュー表に追加しました！")
                 else:
                     st.warning("作品データを抽出できませんでした。購入履歴ページでコピーしたテキストが入っているか確認してください。")
 
     with sub_b:
+        fanza_text = st.text_area(
+            "FANZA / DMMの購入済み一覧でコピーしたテキスト（日付・コミック/ボイス/ゲーム・作品名・サークル名）を貼り付け",
+            placeholder="例:\n2026年08月24日\nコミック\n愛が重すぎる彼女達に温泉旅館に缶詰にされた時の話\n全角14字\n\nコミック\n距離感がバグってる義妹が一生イチャラブしてくる【フルカラー版】\n聖華快楽書店",
+            height=140
+        )
+        col_fz1, col_fz2 = st.columns(2)
+        with col_fz1:
+            fanza_plat = st.selectbox("購入元の選択", ["FANZA", "DMM"], key="fz_plat")
+        with col_fz2:
+            fanza_date = st.date_input("購入日（日付行がない場合用）", value=date.today(), key="fz_date")
+        if st.button("① FANZA/DMMテキストから作品・巻数情報を自動抽出"):
+            fz_rows = parse_fanza_dmm_text(fanza_text, fanza_date.strftime("%Y/%m/%d"), platform_name=fanza_plat)
+            if fz_rows:
+                st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(fz_rows)], ignore_index=True)
+                st.success(f"{fanza_plat}の画面コピーから {len(fz_rows)} 件の作品（種別・フルカラー等も自動判定）をプレビュー表に追加しました！")
+            else:
+                st.warning("作品を抽出できませんでした。「コミック」「ボイス」「ゲーム」などの種別行が含まれているか確認してください。")
+
+    with sub_c:
+        amz_text = st.text_area(
+            "Amazonの「コンテンツと端末の管理（本の一覧）」で画面全体（Ctrl+A -> Ctrl+C）をコピーしたテキストを貼り付け",
+            placeholder="・Amazonの「コンテンツと端末の管理」の画面全体をCtrl+A -> Ctrl+Cでコピーしてそのままペースト！\n・『デバイスからの配信または削除』『削除』などの不要文字は自動で全削除され、（1）〜（6）の巻数も自動で『1〜6』に集約されます。",
+            height=140
+        )
+        col_am1, col_am2 = st.columns([1, 2])
+        with col_am1:
+            amz_type = st.selectbox("一括設定する種別", ["漫画", "小説", "その他"], key="amz_type_select")
+        if st.button("① Amazonテキストから作品・巻数情報を自動抽出"):
+            amz_rows = parse_amazon_kindle_text(amz_text, fallback_type=amz_type)
+            if amz_rows:
+                st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(amz_rows)], ignore_index=True)
+                st.success(f"Amazonの画面コピーから不要な文字を除去し、{len(amz_rows)} 件のシリーズ（巻数を自動統合）をプレビュー表に追加しました！")
+            else:
+                st.warning("Amazonの購入データを抽出できませんでした。「取得日: ○年○月○日」を含むテキストが入っているか確認してください。")
+
+    with sub_d:
         col_b1, col_b2, col_b3, col_b4 = st.columns(4)
         with col_b1:
-            bulk_type = st.selectbox("一括設定する種別", ["漫画", "小説", "ボイス/ASMR", "ゲーム", "その他"], key="b_type")
+            bulk_type = st.selectbox("一括設定する種別", MEDIA_TYPES, key="b_type")
         with col_b2:
             bulk_ed = st.selectbox("一括設定する版・仕様", EDITION_OPTIONS, key="b_ed")
         with col_b3:
-            bulk_plat = st.selectbox("一括設定する購入元", ["Amazon", "DLsite", "DMM", "FANZA", "BOOTH", "その他"], key="b_plat")
+            bulk_plat = st.selectbox("一括設定する購入元", PLATFORM_OPTIONS, key="b_plat")
         with col_b4:
             bulk_date = st.date_input("一括設定する購入日", value=date.today(), key="b_date")
 
@@ -673,11 +925,17 @@ with tab3:
                 st.success(f"{len(added_rows)}件を下のプレビュー表に追加しました！")
 
     st.subheader("登録前の確認・編集プレビュー表")
-    st.caption("表のセルをダブルクリックして「版・仕様」や「所持巻数」を直接修正したり、末尾の「＋」で行を追加できます。")
+    st.caption("タイトルが長すぎて末尾が切れていた場合も、下の表の「版・仕様」セルをクリックするとプルダウンからワンクリックで「フルカラー」等に切り替えられます。")
     edited_df = st.data_editor(
         st.session_state.bulk_df,
         num_rows="dynamic",
         use_container_width=True,
+        column_config={
+            "種別": st.column_config.SelectboxColumn("種別", options=MEDIA_TYPES),
+            "版・仕様": st.column_config.SelectboxColumn("版・仕様", options=EDITION_OPTIONS),
+            "完結": st.column_config.SelectboxColumn("完結", options=["", "★", "☆"]),
+            "購入元": st.column_config.SelectboxColumn("購入元", options=PLATFORM_OPTIONS),
+        },
         key="bulk_editor"
     )
 
