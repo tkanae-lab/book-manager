@@ -82,7 +82,7 @@ def load_data():
         return pd.DataFrame(columns=COLUMNS)
 
 def add_row(row_dict):
-    res = requests.post(GAS_URL, json=row_dict, timeout=20)
+    res = requests.post(GAS_URL, json=row_dict, timeout=90)
     res.raise_for_status()
     return res.json()
 
