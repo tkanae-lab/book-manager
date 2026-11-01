@@ -67,7 +67,7 @@ if not GAS_URL:
 @st.cache_data(ttl=60)
 def load_data():
     try:
-        res = requests.get(GAS_URL, timeout=15)
+        res = requests.get(GAS_URL, timeout=30)
         res.raise_for_status()
         data = res.json()
         df = pd.DataFrame(data, columns=COLUMNS)
@@ -87,19 +87,20 @@ def add_row(row_dict):
     return res.json()
 
 def normalize_base_title(title):
-    """タイトルから【特装版】【フルカラー】や末尾の省略記号（... / …）を取り除いたベース作品名を返す"""
+    """タイトルから【特装版】【フルカラー】や末尾の [サークル名]・省略記号（... / …）を取り除いたベース作品名を返す"""
     t = str(title).strip()
-    t = re.sub(r"[\[【\(（].*?(特装|限定|フルカラー|セミカラー|カラー|デジタル版|文庫|新装|愛蔵|完全版).*?[\]】\)）]", "", t)
-    t = re.sub(r"\s*(特装版|限定版|フルカラー版?|セミカラー版?|文庫版|新装版|愛蔵版|完全版)$", "", t)
+    t = re.sub(r"\s*\[[^\[\]]+\]$", "", t)
+    t = re.sub(r"[\[【\(（].*?(特装|限定|フルカラー|セミカラー|カラー|デジタル版|文庫|新装|愛蔵|完全版|特典|お試し|無料).*?[\]】\)）]", "", t)
+    t = re.sub(r"\s*(特装版|限定版|フルカラー版?|セミカラー版?|カラー版|モノクロ版|文庫版|新装版|愛蔵版|完全版|豪華版|特盛版)$", "", t)
     t = re.sub(r"(\.{2,}|…+)$", "", t)
     return t.strip()
 
 def detect_edition_from_title(title_str):
-    if "フルカラー" in title_str or "極彩色" in title_str:
-        return "フルカラー"
     if "セミカラー" in title_str:
         return "セミカラー"
-    if "特装版" in title_str or "限定版" in title_str:
+    if "フルカラー" in title_str or "カラー版" in title_str or "極彩色" in title_str:
+        return "フルカラー"
+    if "特装版" in title_str or "限定版" in title_str or "豪華版" in title_str or "特盛版" in title_str:
         return "特装版・限定版"
     if "文庫" in title_str or "新装版" in title_str or "愛蔵版" in title_str:
         return "文庫・新装版"
@@ -162,7 +163,6 @@ def parse_volume_tokens(vol_str):
     return expanded, list(dict.fromkeys(multi_spec_vols))
 
 def merge_volume_strings(old_vol_str, new_vol_str):
-    """既存の所持巻数と新しい所持巻数を統合する"""
     old_s = str(old_vol_str).strip()
     new_s = str(new_vol_str).strip()
     if not old_s:
@@ -190,7 +190,7 @@ def detect_all_dual_owned(df):
         if bt and title_counts[bt] >= 2:
             other_rows = df[base_titles == bt]
             desc_list = [f"{r['購入元'] or '未設定'}:{r['版・仕様']}" for _, r in other_rows.iterrows()]
-            reasons.append(f"複数行登録あり（{' / '.join(desc_list)}）")
+            reasons.append(f"複数行登録あり（{' / '.join(desc_list[:4])}）")
 
         if "＋" in ed or "+" in ed or "二重" in ed:
             reasons.append(f"仕様欄で二重所持（{ed}）")
@@ -204,10 +204,6 @@ def detect_all_dual_owned(df):
     return reasons_per_index
 
 def annotate_bulk_actions(df_existing, new_rows_list):
-    """
-    一括取り込み候補の各行を既存データと照合し、
-    「同サイト上書き補完」「バージョン違い（別仕様）」「別サイト重複」「新規登録」を自動判定する
-    """
     annotated = []
     for item in new_rows_list:
         row_copy = {col: str(item.get(col, "")).strip() for col in COLUMNS}
@@ -259,13 +255,15 @@ def annotate_bulk_actions(df_existing, new_rows_list):
             prev_ed = same_base_diff_ed["版・仕様"]
             prev_plat = same_base_diff_ed["購入元"] or "未設定"
             note_add = f"別仕様所持あり({prev_plat}:{prev_ed})"
-            row_copy["備考"] = f"{row_copy['備考']} / {note_add}".strip(" /")
+            if note_add not in row_copy["備考"]:
+                row_copy["備考"] = f"{row_copy['備考']} / {note_add}".strip(" /")
         elif diff_site_match is not None:
             action = "⚠️ 別サイト/既存あり（別行として新規追加）"
             prev_plat = diff_site_match["購入元"] or "Keepメモ(購入元未設定)"
             prev_vol = diff_site_match["所持巻数"] or "巻数未設定"
             note_add = f"他枠所持あり({prev_plat}: {prev_vol})"
-            row_copy["備考"] = f"{row_copy['備考']} / {note_add}".strip(" /")
+            if note_add not in row_copy["備考"]:
+                row_copy["備考"] = f"{row_copy['備考']} / {note_add}".strip(" /")
 
         row_with_action = {"処理区分": action}
         row_with_action.update(row_copy)
@@ -415,45 +413,88 @@ def classify_dlsite_type(tag_text):
     return "漫画"
 
 def consolidate_series_rows(raw_items, platform_name):
-    """抽出した作品リストから同一シリーズの巻数と購入金額を自動で1行にまとめる"""
-    vol_suffix_pat = re.compile(r"^(.*?)(?:[\s　]*[第\(（【\[巻]*(\d+)[\)）】\]巻]*)$")
+    """抽出した作品リストから同一シリーズの巻数（単巻・パック・第N話）と購入金額を自動で1行にまとめる"""
     grouped = {}
     order_keys = []
 
     for it in raw_items:
         t = it["title"].strip()
-        t_norm = t.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
-        m_vol = vol_suffix_pat.match(t_norm)
+        # タイトル末尾に [サークル名] が残っている場合は分離する
+        m_br = re.match(r"^(.*?)\s*\[([^\[\]]+)\]$", t)
+        if m_br:
+            t = m_br.group(1).strip()
+            if not it.get("maker") or it.get("maker") == t:
+                it["maker"] = m_br.group(2).strip()
+
+        t_norm = t.translate(str.maketrans("０１２３４５６７８９（）", "0123456789()"))
         p_val = it.get("price")
         age_val = it.get("age", "")
+        ed_val = detect_edition_from_title(t)
 
-        if m_vol and not it.get("owned_cnt") and m_vol.group(1).strip():
-            base_t = m_vol.group(1).strip()
-            v_num = int(m_vol.group(2))
-            key = (base_t, it["maker"], it["mtype"])
+        m_pack_range = re.match(r"^(.*?)[\s　]*(\d+)(?:巻)?[〜~～\-](\d+)巻パック(.*)$", t_norm)
+        m_pack_single = re.match(r"^(.*?)[\s　]*(\d+)巻パック(.*)$", t_norm)
+        m_vol_tag = re.match(r"^(.*?)\s*[Vv]ol\.?\s*(\d+)\s*(【.*?】)?$", t_norm)
+        m_ep = re.match(r"^(.*?)\s*第(\d+)話(.*)$", t_norm)
+        m_trail = re.match(r"^(.*?)(?:[\s　]+(\d+)巻?|\((\d+)\))(?:[\s　]*【comipo限定特典付き】)?$", t_norm)
+
+        if not it.get("owned_cnt") and m_pack_range and m_pack_range.group(1).strip():
+            base_t = (m_pack_range.group(1).strip() + " " + m_pack_range.group(4).strip()).strip()
+            s_v, e_v = int(m_pack_range.group(2)), int(m_pack_range.group(3))
+            key = ("VOL", base_t, it["maker"], it["mtype"], ed_val)
             if key not in grouped:
-                grouped[key] = {
-                    "vols": [],
-                    "prices": [],
-                    "age": age_val,
-                    "date": it["date"],
-                    "owned_cnt": None,
-                    "total_cnt": None,
-                    "extra_note": it.get("note", "")
-                }
+                grouped[key] = {"vols": [], "prices": [], "age": age_val, "date": it["date"], "ed": ed_val}
+                order_keys.append(key)
+            grouped[key]["vols"].extend(range(s_v, e_v + 1))
+            if p_val is not None:
+                grouped[key]["prices"].append(p_val)
+        elif not it.get("owned_cnt") and m_pack_single and m_pack_single.group(1).strip():
+            base_t = (m_pack_single.group(1).strip() + " " + m_pack_single.group(3).strip()).strip()
+            e_v = int(m_pack_single.group(2))
+            key = ("VOL", base_t, it["maker"], it["mtype"], ed_val)
+            if key not in grouped:
+                grouped[key] = {"vols": [], "prices": [], "age": age_val, "date": it["date"], "ed": ed_val}
+                order_keys.append(key)
+            grouped[key]["vols"].extend(range(1, e_v + 1))
+            if p_val is not None:
+                grouped[key]["prices"].append(p_val)
+        elif not it.get("owned_cnt") and m_vol_tag and m_vol_tag.group(1).strip():
+            base_t = f"{m_vol_tag.group(1).strip()}{m_vol_tag.group(3) or ''}".strip()
+            v_num = int(m_vol_tag.group(2))
+            key = ("VOL", base_t, it["maker"], it["mtype"], ed_val)
+            if key not in grouped:
+                grouped[key] = {"vols": [], "prices": [], "age": age_val, "date": it["date"], "ed": ed_val}
                 order_keys.append(key)
             grouped[key]["vols"].append(v_num)
             if p_val is not None:
                 grouped[key]["prices"].append(p_val)
-            if age_val and not grouped[key]["age"]:
-                grouped[key]["age"] = age_val
+        elif not it.get("owned_cnt") and m_ep and not m_ep.group(3).strip():
+            base_t = m_ep.group(1).strip()
+            ep_num = int(m_ep.group(2))
+            key = ("EP", base_t, it["maker"], it["mtype"], ed_val)
+            if key not in grouped:
+                grouped[key] = {"eps": [], "prices": [], "age": age_val, "date": it["date"], "ed": ed_val}
+                order_keys.append(key)
+            grouped[key]["eps"].append(ep_num)
+            if p_val is not None:
+                grouped[key]["prices"].append(p_val)
+        elif not it.get("owned_cnt") and m_trail and m_trail.group(1).strip():
+            base_t = m_trail.group(1).strip()
+            v_num = int(m_trail.group(2) or m_trail.group(3))
+            key = ("VOL", base_t, it["maker"], it["mtype"], ed_val)
+            if key not in grouped:
+                grouped[key] = {"vols": [], "prices": [], "age": age_val, "date": it["date"], "ed": ed_val}
+                order_keys.append(key)
+            grouped[key]["vols"].append(v_num)
+            if p_val is not None:
+                grouped[key]["prices"].append(p_val)
         else:
-            key = (t, it["maker"], it["mtype"], len(order_keys))
+            key = ("SINGLE", t, it["maker"], it["mtype"], len(order_keys))
             grouped[key] = {
                 "vols": [],
                 "prices": [p_val] if p_val is not None else [],
                 "age": age_val,
                 "date": it["date"],
+                "ed": ed_val,
                 "owned_cnt": it.get("owned_cnt"),
                 "total_cnt": it.get("total_cnt"),
                 "exact_title": t,
@@ -464,9 +505,9 @@ def consolidate_series_rows(raw_items, platform_name):
     final_rows = []
     for key in order_keys:
         g = grouped[key]
-        title_out = g.get("exact_title", key[0])
-        maker_out = key[1]
-        mtype_out = key[2]
+        title_out = g.get("exact_title", key[1])
+        maker_out = key[2]
+        mtype_out = key[3]
 
         notes = []
         if g.get("extra_note"):
@@ -474,23 +515,24 @@ def consolidate_series_rows(raw_items, platform_name):
         if title_out.endswith("...") or title_out.endswith("…"):
             notes.append("※タイトル末尾省略あり")
 
-        if g["vols"]:
+        if g.get("vols"):
             vol_str = compress_int_volumes(g["vols"])
+        elif g.get("eps"):
+            vol_str = f"第{compress_int_volumes(g['eps'])}話"
         elif g.get("owned_cnt"):
             vol_str = f"計{g['owned_cnt']}冊（巻数未展開）"
             notes.append(f"Play集約({g['owned_cnt']}/{g['total_cnt']})")
         else:
             vol_str = ""
 
-        total_price_str = str(sum(g["prices"])) if g["prices"] else ""
-        edition = detect_edition_from_title(title_out)
+        total_price_str = str(sum(g["prices"])) if g.get("prices") else ""
 
         final_rows.append({
             "固有ID": "",
             "タイトル": title_out,
             "年齢区分": g.get("age", ""),
             "種別": mtype_out,
-            "版・仕様": edition,
+            "版・仕様": g.get("ed", "通常"),
             "所持巻数": vol_str,
             "完結": "",
             "作者・サークル": maker_out,
@@ -503,85 +545,74 @@ def consolidate_series_rows(raw_items, platform_name):
     return final_rows
 
 def parse_dlsite_copied_text(text, fallback_date, default_age="自動判別"):
-    """DLsiteの購入履歴テーブルまたはDLsite Play本棚の全選択コピーを自動解析する"""
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if not lines:
+    """
+    DLsiteの購入履歴テーブル（タブ区切り・サムネイル文字混在）またはDLsite Play本棚の
+    全選択コピーをブロック単位で正確に解析し、タイトル・サークル名・金額・年齢区分を抽出する
+    """
+    if not text.strip():
         return []
 
-    userbuy_date_pat = re.compile(r"^(\d{4})/(\d{1,2})/(\d{1,2})(?:\s+(\d{1,2}:\d{1,2}))?")
+    block_pat = re.compile(r"(\d{4}/\d{1,2}/\d{1,2})(?=\s|\t|$)")
     play_date_pat = re.compile(r"^(\d{4})年(\d{1,2})月(\d{1,2})日\s*購入")
-    meta_pat = re.compile(r"^(?:(\d+)/(\d+)作品)?.*?(マンガ・CG|ボイス・ASMR|ノベル|ゲーム|動画|音楽|ツール|その他).*?$")
-    only_count_pat = re.compile(r"^(\d+)/(\d+)作品$")
-    price_pat = re.compile(r"^([\d,，]+)\s*円$")
-
-    tag_keywords = [
-        "全年齢", "R-18", "R15", "成人向け", "マンガ", "単行本", "雑誌", "WEBマンガ",
-        "劇画", "CG・イラスト", "CG", "ボイス・ASMR", "ボイス", "ASMR", "音楽", "音素材",
-        "ノベル", "小説", "デジタルノベル", "ロールプレイング", "シミュレーション",
-        "アクション", "アドベンチャー", "シューティング", "パズル", "クイズ", "テーブル",
-        "タイピング", "その他ゲーム", "ゲーム", "動画", "ツール"
-    ]
-    junk_keywords = [
-        "視聴", "DL", "ダウンロード", "ブラウザ", "評価する", "評価済", "レビュー",
-        "全額ポイント", "ポイント", "クレジット", "購入日時", "アフィリエイト"
-    ]
 
     raw_items = []
 
-    # パターン1: 購入履歴テーブル（2026/08/24 02:01 形式）
-    if any(userbuy_date_pat.match(l) for l in lines):
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            m_date = userbuy_date_pat.match(line)
-            if m_date:
-                d_str = f"{int(m_date.group(1)):04d}/{int(m_date.group(2)):02d}/{int(m_date.group(3)):02d}"
-                if i + 1 < len(lines):
-                    title = lines[i+1]
-                    maker = ""
-                    collected_tags = []
-                    item_price = None
+    # パターン1: 購入履歴テーブル（2026/08/24 形式の日付ブロック）
+    if block_pat.search(text):
+        parts = block_pat.split(text)
+        for k in range(1, len(parts), 2):
+            d_raw = parts[k]
+            body = parts[k + 1] if k + 1 < len(parts) else ""
+            m_d = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})", d_raw)
+            d_str = f"{int(m_d.group(1)):04d}/{int(m_d.group(2)):02d}/{int(m_d.group(3)):02d}"
 
-                    for j in range(i + 2, min(i + 12, len(lines))):
-                        sub_l = lines[j]
-                        if userbuy_date_pat.match(sub_l):
-                            break
-                        m_pr = price_pat.match(sub_l)
-                        if m_pr:
-                            item_price = int(m_pr.group(1).replace(",", "").replace("，", ""))
-                            continue
-                        if sub_l == "-" or any(jk in sub_l for jk in junk_keywords):
-                            continue
-                        if any(tk in sub_l for tk in tag_keywords):
-                            collected_tags.append(sub_l)
-                        elif not maker:
-                            maker = sub_l
+            # 1) サムネイル画像の "作品名 [サークル・出版社名]" パターンがあればそこから正確に分離
+            m_alt = re.search(r"([^\r\n\t]+?)\s*\[([^\[\]\r\n\t]+)\]", body)
+            if m_alt:
+                raw_t = re.sub(r"^\d{1,2}:\d{2}\s*", "", m_alt.group(1)).strip()
+                maker = m_alt.group(2).strip()
+                title = raw_t
+            else:
+                tokens = [re.sub(r"^\d{1,2}:\d{2}\s*", "", seg).strip() for seg in re.split(r"[\r\n\t]+", body)]
+                tokens = [seg for seg in tokens if seg and seg != "-"]
+                title = tokens[0] if len(tokens) > 0 else ""
+                maker = tokens[1] if len(tokens) > 1 else ""
 
-                    tag_joined = " ".join(collected_tags)
-                    mtype = classify_dlsite_type(tag_joined)
-                    if default_age != "自動判別":
-                        age_val = default_age
-                    elif "全年齢" in tag_joined:
-                        age_val = "全年齢"
-                    elif "R-18" in tag_joined or "成人" in tag_joined or "R15" in tag_joined:
-                        age_val = "R-18"
-                    else:
-                        age_val = "R-18"
+            if not title:
+                continue
 
-                    raw_items.append({
-                        "title": title,
-                        "maker": maker,
-                        "mtype": mtype,
-                        "age": age_val,
-                        "price": item_price,
-                        "date": d_str,
-                        "owned_cnt": None,
-                        "total_cnt": None
-                    })
-            i += 1
+            # 2) タブ区切りや改行の中に含まれる金額（例: 792円, 1,320円, 0円）を抽出
+            m_price = re.search(r"([\d,，]+)\s*円", body)
+            item_price = int(m_price.group(1).replace(",", "").replace("，", "")) if m_price else None
+
+            # 3) 年齢区分と種別の判定
+            if default_age != "自動判別":
+                age_val = default_age
+            elif "全年齢" in body:
+                age_val = "全年齢"
+            elif "R-18" in body or "成人" in body or "R15" in body:
+                age_val = "R-18"
+            else:
+                age_val = "R-18"
+
+            mtype = classify_dlsite_type(body)
+
+            raw_items.append({
+                "title": title,
+                "maker": maker,
+                "mtype": mtype,
+                "age": age_val,
+                "price": item_price,
+                "date": d_str,
+                "owned_cnt": None,
+                "total_cnt": None
+            })
 
     # パターン2: DLsite Play本棚画面（2026年8月24日 購入 形式）
-    elif any(play_date_pat.match(l) for l in lines):
+    else:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        meta_pat = re.compile(r"^(?:(\d+)/(\d+)作品)?.*?(マンガ・CG|ボイス・ASMR|ノベル|ゲーム|動画|音楽|ツール|その他).*?$")
+        only_count_pat = re.compile(r"^(\d+)/(\d+)作品$")
         current_date = fallback_date
         buffer = []
         for line in lines:
@@ -627,13 +658,12 @@ def parse_dlsite_copied_text(text, fallback_date, default_age="自動判別"):
     return consolidate_series_rows(raw_items, "DLsite")
 
 def parse_fanza_dmm_text(text, fallback_date, platform_name="FANZA"):
-    """FANZA / DMMの購入済み一覧テキストを自動解析する"""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
         return []
 
     date_pat = re.compile(r"^(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})日?(?:\s*購入)?")
-    price_pat = re.compile(r"^([\d,，]+)\s*円$")
+    price_pat = re.compile(r"([\d,，]+)\s*円")
     cat_map = {
         "コミック": "漫画",
         "マンガ": "漫画",
@@ -688,8 +718,8 @@ def parse_fanza_dmm_text(text, fallback_date, platform_name="FANZA"):
                 cand = lines[j]
                 if date_pat.match(cand) or cand in cat_map:
                     break
-                m_pr = price_pat.match(cand)
-                if m_pr:
+                m_pr = price_pat.search(cand)
+                if m_pr and cand.endswith("円"):
                     item_price = int(m_pr.group(1).replace(",", "").replace("，", ""))
                     j += 1
                     continue
@@ -719,7 +749,6 @@ def parse_fanza_dmm_text(text, fallback_date, platform_name="FANZA"):
     return consolidate_series_rows(raw_items, platform_name)
 
 def parse_amazon_kindle_text(text, fallback_type="漫画", default_age="全年齢"):
-    """Amazonの『コンテンツと端末の管理』の全選択コピーを自動解析して巻数をまとめる"""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
         return []
@@ -898,7 +927,6 @@ with tab1:
     if platform_filter != "すべて":
         filtered_df = filtered_df[filtered_df["購入元"] == platform_filter]
 
-    # 金額合計の集計
     total_yen = sum(
         int(re.sub(r"[^\d]", "", str(x)))
         for x in filtered_df["金額"]
@@ -992,7 +1020,7 @@ with tab3:
     with sub_a:
         rj_text = st.text_area(
             "DLsiteの購入履歴画面（Ctrl+Aで丸ごとコピーしたもの）、またはRJ/BJ番号リストを貼り付け",
-            placeholder="・購入履歴ページの画面全体（Ctrl+A -> Ctrl+C）をそのまま貼り付けOK！\n・『全年齢 / R-18』『792円』などの年齢区分・金額も自動で抽出し、複数巻は合計金額を算出します。\n・既に登録済みの作品を貼った場合は『🔄 同サイト上書き補完』となり、抜けていた金額や年齢区分だけが既存行に埋まります。",
+            placeholder="・購入履歴ページの画面全体（Ctrl+A -> Ctrl+C）をそのまま貼り付けOK！\n・サムネイル文字（作品名 [サークル名]）からタイトルとサークル名を自動分離し、タブ区切り内の『792円』などの金額もすべて自動抽出します。",
             height=140
         )
         col_d1, col_d2 = st.columns(2)
