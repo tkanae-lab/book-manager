@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import re
 import html
+import unicodedata
 from datetime import date
 from collections import Counter
 
@@ -75,6 +76,7 @@ def load_data():
             if col not in df.columns:
                 df[col] = ""
         df = df[COLUMNS].fillna("").astype(str)
+        df = df[~((df["タイトル"] == "タイトル") & (df["固有ID"] == "固有ID"))].reset_index(drop=True)
         df["版・仕様"] = df["版・仕様"].apply(lambda x: x if x.strip() else "通常")
         return df
     except Exception as e:
@@ -87,13 +89,29 @@ def add_row(row_dict):
     return res.json()
 
 def normalize_base_title(title):
-    """タイトルから【特装版】【フルカラー】や末尾の [サークル名]・省略記号（... / …）を取り除いたベース作品名を返す"""
+    """タイトルから【特装版】【フルカラー】【特典】や末尾の [サークル名]・省略記号（... / …）を取り除いたベース作品名を返す"""
     t = str(title).strip()
     t = re.sub(r"\s*\[[^\[\]]+\]$", "", t)
-    t = re.sub(r"[\[【\(（].*?(特装|限定|フルカラー|セミカラー|カラー|デジタル版|文庫|新装|愛蔵|完全版|特典|お試し|無料).*?[\]】\)）]", "", t)
+    t = re.sub(r"^[\[【\(（].*?(特典|無料|お試し|デジタルポスター|ポスター|DLsite).*?[\]】\)）]\s*", "", t)
+    t = re.sub(r"[\[【\(（].*?(特装|限定|フルカラー|セミカラー|カラー|デジタル版|文庫|新装|愛蔵|完全版|特典|お試し|無料|ポスター|創業祭).*?[\]】\)）]", "", t)
+    t = re.sub(r"[\[【\(（][^\]】\)）]*(特典|無料|お試し|創業祭)[^\]】\)）]*$", "", t)
     t = re.sub(r"\s*(特装版|限定版|フルカラー版?|セミカラー版?|カラー版|モノクロ版|文庫版|新装版|愛蔵版|完全版|豪華版|特盛版)$", "", t)
     t = re.sub(r"(\.{2,}|…+)$", "", t)
     return t.strip()
+
+def normalize_for_search(s):
+    """検索用：全角半角・大文字小文字・記号・スペースの揺れを吸収した文字列を返す"""
+    t = unicodedata.normalize("NFKC", str(s)).lower()
+    t = re.sub(r"[\s\u3000×x✕・〜~～\-－―_!！?？:：/／「」『』【】\[\]()（）,、.。・…]+", "", t)
+    return t
+
+def is_bonus_or_trial_row(row):
+    t = str(row.get("タイトル", ""))
+    v = str(row.get("所持巻数", ""))
+    p = str(row.get("金額", ""))
+    if re.search(r"(特典|ポスター|無料|お試し|創業祭)", t) or v == "特典" or p == "0":
+        return True
+    return False
 
 def detect_edition_from_title(title_str):
     if "セミカラー" in title_str:
@@ -177,31 +195,64 @@ def merge_volume_strings(old_vol_str, new_vol_str):
     return new_s
 
 def detect_all_dual_owned(df):
+    """
+    重複・関連所持を4つの明確なカテゴリに分類し、
+    『どの作品（タイトル・サイト・種別・版・巻数）と重なっているか』を返す
+    戻り値: dict[index] -> {"category": str, "detail": str, "base_title": str}
+    """
     base_titles = df["タイトル"].apply(normalize_base_title)
     title_counts = Counter([bt for bt in base_titles if bt])
 
-    reasons_per_index = {}
+    info_per_index = {}
     for idx, row in df.iterrows():
-        reasons = []
-        bt = normalize_base_title(row["タイトル"])
+        bt = base_titles.loc[idx]
         ed = str(row["版・仕様"]).strip()
         vol_str = str(row["所持巻数"]).strip()
+        details = []
+        cat = None
 
         if bt and title_counts[bt] >= 2:
-            other_rows = df[base_titles == bt]
-            desc_list = [f"{r['購入元'] or '未設定'}:{r['版・仕様']}" for _, r in other_rows.iterrows()]
-            reasons.append(f"複数行登録あり（{' / '.join(desc_list[:4])}）")
+            group_rows = df[base_titles == bt]
+            other_rows = group_rows.drop(index=idx)
+            types = set(group_rows["種別"])
+            bonuses = [is_bonus_or_trial_row(r) for _, r in group_rows.iterrows()]
+            eds = set(group_rows["版・仕様"])
 
-        if "＋" in ed or "+" in ed or "二重" in ed:
-            reasons.append(f"仕様欄で二重所持（{ed}）")
+            if any(bonuses) and not all(bonuses):
+                cat = "🎁 特典・無料版とのセット"
+            elif len(types) >= 2:
+                cat = "📚 別メディア（漫画/小説/ボイス）"
+            elif any("カラー" in e or "文庫" in e for e in eds):
+                cat = "🎨 カラー版・文庫版（仕様違い）"
+            else:
+                cat = "🚨 要確認（通常＋特装版／別サイト重複）"
+
+            partner_descs = []
+            for _, r in other_rows.iterrows():
+                p_plat = r["購入元"] or "Keepメモ"
+                p_type = r["種別"]
+                p_ed = r["版・仕様"]
+                p_vol = f" / {r['所持巻数']}" if str(r["所持巻数"]).strip() else ""
+                partner_descs.append(f"『{r['タイトル']}』({p_plat}・{p_type}・{p_ed}{p_vol})")
+            details.append("相手: " + " ｜ ".join(partner_descs[:3]))
 
         _, dup_vols = parse_volume_tokens(vol_str)
         if dup_vols:
-            reasons.append(f"巻数重複・別仕様あり（{', '.join(dup_vols)}）")
+            if not cat:
+                cat = "🚨 要確認（通常＋特装版／別サイト重複)"
+            details.append(f"同一行内で巻数重複・別仕様あり({', '.join(dup_vols)})")
 
-        if reasons:
-            reasons_per_index[idx] = " / ".join(reasons)
-    return reasons_per_index
+        if ("＋" in ed or "+" in ed or "二重" in ed) and not cat:
+            cat = "🚨 要確認（通常＋特装版／別サイト重複）"
+            details.append(f"仕様欄で二重所持({ed})")
+
+        if cat:
+            info_per_index[idx] = {
+                "category": cat,
+                "detail": " / ".join(details),
+                "base_title": bt or str(row["タイトル"])
+            }
+    return info_per_index
 
 def annotate_bulk_actions(df_existing, new_rows_list):
     annotated = []
@@ -574,7 +625,7 @@ def parse_dlsite_copied_text(text, fallback_date, default_age="自動判別"):
                 title = raw_t
             else:
                 tokens = [re.sub(r"^\d{1,2}:\d{2}\s*", "", seg).strip() for seg in re.split(r"[\r\n\t]+", body)]
-                tokens = [seg for seg in tokens if seg and seg != "-"]
+                tokens = [seg for seg in tokens if seg and seg != "-" and not re.match(r"^\d{1,2}[:：]\d{2}$", seg)]
                 title = tokens[0] if len(tokens) > 0 else ""
                 maker = tokens[1] if len(tokens) > 1 else ""
 
@@ -874,9 +925,39 @@ with tab1:
             st.cache_data.clear()
             st.rerun()
 
-    col_s, col_f0, col_f1, col_f2, col_f3 = st.columns([2, 1, 1, 1, 1])
+    # 買う前のまとめて所持チェッカー（折りたたみ式）
+    with st.expander("🛒 買う前の「まとめて所持チェッカー」（セール時やカート内のダブり買い防止・登録はされません）", expanded=False):
+        st.caption("買おうか迷っている作品タイトル（1行に1作品、またはショップ画面のコピー）を貼り付けると、手持ちの台帳と照合して『未所持』『所持済み』『カラー/別版で所持』『別メディアで所持』を一括判定します。")
+        chk_text = st.text_area("チェックしたい作品名を入力（複数行OK）", placeholder="例:\n終末のハーレム\nキミイロ×ライバー\n化物語", height=100, key="pre_buy_check_input")
+        if chk_text.strip():
+            raw_lines = [l.strip() for l in chk_text.splitlines() if l.strip()]
+            chk_results = []
+            df_base_norm = df["タイトル"].apply(lambda x: normalize_for_search(normalize_base_title(x)))
+            for q_line in raw_lines:
+                q_base = normalize_for_search(normalize_base_title(q_line))
+                if len(q_base) < 2:
+                    continue
+                matches = df[df_base_norm.apply(lambda eb: bool(eb and (q_base == eb or (len(q_base) >= 4 and (q_base in eb or eb in q_base)))))]
+                if matches.empty:
+                    chk_results.append({"入力タイトル": q_line, "判定": "🆕 未所持（登録なし）", "所持しているデータ詳細": "—"})
+                else:
+                    m_descs = []
+                    for _, mr in matches.iterrows():
+                        mp = mr["購入元"] or "Keepメモ"
+                        mv = f" [{mr['所持巻数']}巻]" if str(mr["所持巻数"]).strip() else ""
+                        mc = f"({mr['完結']})" if str(mr["完結"]).strip() else ""
+                        m_descs.append(f"『{mr['タイトル']}』({mp} / {mr['種別']} / {mr['版・仕様']}{mv}{mc})")
+                    chk_results.append({
+                        "入力タイトル": q_line,
+                        "判定": f"⚠️ 所持データあり（{len(matches)}件）",
+                        "所持しているデータ詳細": " ｜ ".join(m_descs)
+                    })
+            if chk_results:
+                st.dataframe(pd.DataFrame(chk_results), use_container_width=True, hide_index=True)
+
+    col_s, col_f0, col_f1, col_f2, col_f3 = st.columns([2.2, 1, 1, 1, 1])
     with col_s:
-        keyword = st.text_input("キーワード検索", placeholder="タイトル・サークル・CV・ID・備考で検索")
+        keyword = st.text_input("キーワード検索（スペース区切りで複数語AND・記号/表記揺れ自動吸収）", placeholder="例: キミイロライバー / 集英社 カラー / 嘘つき屋")
     with col_f0:
         age_filter = st.selectbox("年齢区分", ["すべて", "全年齢のみ", "R-18のみ", "未設定のみ"])
     with col_f1:
@@ -889,16 +970,62 @@ with tab1:
         plat_list = ["すべて"] + sorted([x for x in df["購入元"].unique() if x])
         platform_filter = st.selectbox("購入元", plat_list)
 
-    col_chk1, col_chk2 = st.columns([2, 1])
+    # 重複・関連所持の内訳カウント
+    cat_counts = Counter([v["category"] for v in dual_owned_map.values()])
+    real_dup_count = sum(1 for v in dual_owned_map.values() if v["category"].startswith(("🚨", "🎨")))
+
+    col_chk1, col_chk2, col_chk3 = st.columns([2.2, 1.3, 1.2])
     with col_chk1:
-        only_dual = st.checkbox(f"⚠️ 既に二重所持（通常＋特装版／別サイト重複／重複巻）している作品のみ表示（現在 {len(dual_owned_map)} 件該当）")
+        only_dual = st.checkbox(f"⚠️ 重複・別版・関連所持で絞り込む（要確認・仕様違い: {real_dup_count}件 ／ 全関連: {len(dual_owned_map)}件）")
     with col_chk2:
-        use_color = st.checkbox("🎨 種別ごとに色分け表示（漫画=青 / 小説=緑 / ボイス=桃）", value=True)
+        show_cards = st.checkbox("📱 検索結果をカード形式でも表示（15件以下の時）", value=True)
+    with col_chk3:
+        use_color = st.checkbox("🎨 種別ごとに色分け表示", value=True)
 
     filtered_df = df.copy()
     if only_dual:
-        filtered_df = filtered_df.loc[filtered_df.index.isin(dual_owned_map.keys())].copy()
-        filtered_df["二重所持の判定理由"] = [dual_owned_map.get(i, "") for i in filtered_df.index]
+        dup_mode = st.radio(
+            "表示する重複・関連の区分（ペアごとに上下隣り合わせで並びます）",
+            [
+                f"🚨 要確認＋🎨 カラー・仕様違いのみ（{real_dup_count}件：特典・別メディアを除外）",
+                f"🚨 要確認（通常＋特装版／別サイト重複）のみ（{cat_counts.get('🚨 要確認（通常＋特装版／別サイト重複）', 0)}件）",
+                f"🎨 カラー版・文庫版（仕様違い）のみ（{cat_counts.get('🎨 カラー版・文庫版（仕様違い）', 0)}件）",
+                f"📚 別メディア（漫画⇔小説・ボイス）のみ（{cat_counts.get('📚 別メディア（漫画/小説/ボイス）', 0)}件）",
+                f"🎁 特典・無料版とのセットのみ（{cat_counts.get('🎁 特典・無料版とのセット', 0)}件）",
+                f"すべて表示（全 {len(dual_owned_map)} 件）"
+            ],
+            horizontal=True
+        )
+        selected_indices = []
+        for idx_k, info_v in dual_owned_map.items():
+            c_str = info_v["category"]
+            if dup_mode.startswith("🚨 要確認＋🎨"):
+                if c_str.startswith(("🚨", "🎨")):
+                    selected_indices.append(idx_k)
+            elif dup_mode.startswith("🚨 要確認（"):
+                if c_str.startswith("🚨"):
+                    selected_indices.append(idx_k)
+            elif dup_mode.startswith("🎨"):
+                if c_str.startswith("🎨"):
+                    selected_indices.append(idx_k)
+            elif dup_mode.startswith("📚"):
+                if c_str.startswith("📚"):
+                    selected_indices.append(idx_k)
+            elif dup_mode.startswith("🎁"):
+                if c_str.startswith("🎁"):
+                    selected_indices.append(idx_k)
+            else:
+                selected_indices.append(idx_k)
+
+        filtered_df = filtered_df.loc[filtered_df.index.isin(selected_indices)].copy()
+        filtered_df["重複・関連の区分"] = [dual_owned_map[i]["category"] for i in filtered_df.index]
+        filtered_df["重なり相手・詳細"] = [dual_owned_map[i]["detail"] for i in filtered_df.index]
+        filtered_df["_sort_base"] = [dual_owned_map[i]["base_title"] for i in filtered_df.index]
+        filtered_df = filtered_df.sort_values(by=["重複・関連の区分", "_sort_base", "タイトル"]).drop(columns=["_sort_base"])
+        # 見やすいように「重複・関連の区分」「重なり相手・詳細」をタイトルのすぐ右に配置
+        front_cols = ["固有ID", "タイトル", "重複・関連の区分", "重なり相手・詳細"]
+        rest_cols = [c for c in filtered_df.columns if c not in front_cols]
+        filtered_df = filtered_df[front_cols + rest_cols]
 
     if age_filter == "全年齢のみ":
         filtered_df = filtered_df[filtered_df["年齢区分"] == "全年齢"]
@@ -907,15 +1034,26 @@ with tab1:
     elif age_filter == "未設定のみ":
         filtered_df = filtered_df[~filtered_df["年齢区分"].isin(["全年齢", "R-18"])]
 
-    if keyword:
-        mask = (
-            filtered_df["タイトル"].str.contains(keyword, case=False, na=False, regex=False) |
-            filtered_df["固有ID"].str.contains(keyword, case=False, na=False, regex=False) |
-            filtered_df["作者・サークル"].str.contains(keyword, case=False, na=False, regex=False) |
-            filtered_df["CV・出演者"].str.contains(keyword, case=False, na=False, regex=False) |
-            filtered_df["所持巻数"].str.contains(keyword, case=False, na=False, regex=False) |
-            filtered_df["備考"].str.contains(keyword, case=False, na=False, regex=False)
+    if keyword.strip():
+        q_tokens = [tok for tok in re.split(r"[\s\u3000]+", keyword.strip()) if tok]
+        combined_raw = (
+            filtered_df["タイトル"] + " " +
+            filtered_df["固有ID"] + " " +
+            filtered_df["作者・サークル"] + " " +
+            filtered_df["CV・出演者"] + " " +
+            filtered_df["版・仕様"] + " " +
+            filtered_df["購入元"] + " " +
+            filtered_df["所持巻数"] + " " +
+            filtered_df["備考"]
         )
+        combined_norm = combined_raw.apply(normalize_for_search)
+        mask = pd.Series(True, index=filtered_df.index)
+        for qt in q_tokens:
+            qt_norm = normalize_for_search(qt)
+            token_match = combined_raw.str.contains(qt, case=False, na=False, regex=False)
+            if qt_norm:
+                token_match = token_match | combined_norm.str.contains(qt_norm, case=False, na=False, regex=False)
+            mask = mask & token_match
         filtered_df = filtered_df[mask]
 
     if type_filter != "すべて":
@@ -933,6 +1071,23 @@ with tab1:
         if re.sub(r"[^\d]", "", str(x))
     )
     st.write(f"表示件数: **{len(filtered_df)}** 件 / 全 **{len(df)}** 件　｜　💰 表示中の合計金額: **{total_yen:,}** 円")
+
+    # 検索結果が15件以下のとき（かつキーワード入力時または重複絞り込み時）、横スクロール不要のパッと見カードを表示
+    if show_cards and (keyword.strip() or only_dual) and 1 <= len(filtered_df) <= 15:
+        with st.container():
+            st.caption("📱 **パッと見カード表示**（横スクロールなしで所持巻数・仕様・重なり相手を確認できます）")
+            for idx_row, r in filtered_df.iterrows():
+                vol_badge = f"📚 所持: **{r['所持巻数']}**" if str(r["所持巻数"]).strip() else "📚 単巻/巻数記載なし"
+                comp_badge = f"（{r['完結']}）" if str(r["完結"]).strip() else ""
+                plat_badge = r["購入元"] if str(r["購入元"]).strip() else "Keepメモ(購入元未設定)"
+                p_digits = re.sub(r"[^\d]", "", str(r["金額"]))
+                price_badge = f" ｜ 💰 {int(p_digits):,}円" if p_digits else ""
+                dup_info = dual_owned_map.get(idx_row)
+                dup_line = f"  \n👉 **{dup_info['category']}** — {dup_info['detail']}" if dup_info else ""
+                st.markdown(
+                    f"- **{r['タイトル']}** 　`{r['種別']}` `{r['版・仕様']}` `{r['年齢区分'] or '未設定'}`  \n"
+                    f"　{vol_badge}{comp_badge} ｜ 🏢 {r['作者・サークル'] or '—'} ｜ 🛒 **{plat_badge}**{price_badge}{dup_line}"
+                )
 
     if use_color and not filtered_df.empty:
         st.dataframe(style_by_type(filtered_df), use_container_width=True, hide_index=True)
