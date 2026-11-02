@@ -4,7 +4,7 @@ import requests
 import re
 import html
 import unicodedata
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from collections import Counter
 
 st.set_page_config(page_title="電子データ購入管理", layout="wide")
@@ -65,6 +65,30 @@ if not GAS_URL:
     st.code('GAS_URL = "ここにコピーしたウェブアプリのURLを貼り付け"', language="toml")
     st.stop()
 
+def format_clean_date(val):
+    """GASから返るISO形式(2024-03-22T15:00:00.000Z)や表記揺れを日本時間の YYYY/MM/DD に統一する"""
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "nat"):
+        return ""
+    # 1) ISO 8601 UTC形式 (例: 2024-03-22T15:00:00.000Z) -> JST (+9時間) に変換して YYYY/MM/DD
+    m_iso = re.match(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z?$", s)
+    if m_iso:
+        try:
+            dt_utc = datetime(
+                int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)),
+                int(m_iso.group(4)), int(m_iso.group(5)), int(m_iso.group(6)),
+                tzinfo=timezone.utc
+            )
+            dt_jst = dt_utc.astimezone(timezone(timedelta(hours=9)))
+            return dt_jst.strftime("%Y/%m/%d")
+        except Exception:
+            pass
+    # 2) YYYY/M/D, YYYY-M-D, YYYY年M月D日 形式 -> YYYY/MM/DD にゼロ埋め統一
+    m_ymd = re.match(r"^(\d{4})[年/\-\.](\d{1,2})[月/\-\.](\d{1,2})日?", s)
+    if m_ymd:
+        return f"{int(m_ymd.group(1)):04d}/{int(m_ymd.group(2)):02d}/{int(m_ymd.group(3)):02d}"
+    return s
+
 @st.cache_data(ttl=60)
 def load_data():
     try:
@@ -78,6 +102,7 @@ def load_data():
         df = df[COLUMNS].fillna("").astype(str)
         df = df[~((df["タイトル"] == "タイトル") & (df["固有ID"] == "固有ID"))].reset_index(drop=True)
         df["版・仕様"] = df["版・仕様"].apply(lambda x: x if x.strip() else "通常")
+        df["購入日"] = df["購入日"].apply(format_clean_date)
         return df
     except Exception as e:
         st.error(f"データの読み込みに失敗しました: {e}")
