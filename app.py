@@ -65,12 +65,37 @@ if not GAS_URL:
     st.code('GAS_URL = "ここにコピーしたウェブアプリのURLを貼り付け"', language="toml")
     st.stop()
 
+MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
+}
+
 def format_clean_date(val):
-    """GASから返るISO形式(2024-03-22T15:00:00.000Z)や表記揺れを日本時間の YYYY/MM/DD に統一する"""
+    """
+    GASから返るJavaScriptの英語日付文字列 (例: Sat Mar 23 2024 00:00:00 GMT+0900 ...) や
+    ISO形式 (2024-03-22T15:00:00.000Z)、表記揺れをすべて YYYY/MM/DD に統一する
+    """
     s = str(val).strip()
     if not s or s.lower() in ("nan", "none", "nat"):
         return ""
-    # 1) ISO 8601 UTC形式 (例: 2024-03-22T15:00:00.000Z) -> JST (+9時間) に変換して YYYY/MM/DD
+
+    # 1) JavaScript Date.toString() の英語形式 (例: "Sat Mar 23 2024 00:00:00 GMT+0900 (Japan Standard Time)")
+    m_js = re.search(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})[,\s]+(\d{4})\b", s, re.IGNORECASE)
+    if m_js:
+        mon = MONTH_MAP[m_js.group(1)[:3].lower()]
+        day = int(m_js.group(2))
+        year = int(m_js.group(3))
+        return f"{year:04d}/{mon:02d}/{day:02d}"
+
+    # 2) "23 Mar 2024 ..." 形式
+    m_rfc = re.search(r"\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[,\s]+(\d{4})\b", s, re.IGNORECASE)
+    if m_rfc:
+        day = int(m_rfc.group(1))
+        mon = MONTH_MAP[m_rfc.group(2)[:3].lower()]
+        year = int(m_rfc.group(3))
+        return f"{year:04d}/{mon:02d}/{day:02d}"
+
+    # 3) ISO 8601 UTC形式 (例: 2024-03-22T15:00:00.000Z) -> JST (+9時間) に変換して YYYY/MM/DD
     m_iso = re.match(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z?$", s)
     if m_iso:
         try:
@@ -83,10 +108,12 @@ def format_clean_date(val):
             return dt_jst.strftime("%Y/%m/%d")
         except Exception:
             pass
-    # 2) YYYY/M/D, YYYY-M-D, YYYY年M月D日 形式 -> YYYY/MM/DD にゼロ埋め統一
-    m_ymd = re.match(r"^(\d{4})[年/\-\.](\d{1,2})[月/\-\.](\d{1,2})日?", s)
+
+    # 4) YYYY/M/D, YYYY-M-D, YYYY年M月D日 形式 -> YYYY/MM/DD にゼロ埋め統一
+    m_ymd = re.search(r"(\d{4})[年/\-\.](\d{1,2})[月/\-\.](\d{1,2})日?", s)
     if m_ymd:
         return f"{int(m_ymd.group(1)):04d}/{int(m_ymd.group(2)):02d}/{int(m_ymd.group(3)):02d}"
+
     return s
 
 @st.cache_data(ttl=60)
