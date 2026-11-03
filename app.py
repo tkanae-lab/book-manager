@@ -669,14 +669,20 @@ def parse_dlsite_copied_text(text, fallback_date, default_age="自動判別"):
             m_d = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})", d_raw)
             d_str = f"{int(m_d.group(1)):04d}/{int(m_d.group(2)):02d}/{int(m_d.group(3)):02d}"
 
-            # 1) サムネイル画像の "作品名 [サークル・出版社名]" パターンがあればそこから正確に分離
-            m_alt = re.search(r"([^\r\n\t]+?)\s*\[([^\[\]\r\n\t]+)\]", body)
-            if m_alt:
-                raw_t = re.sub(r"^\d{1,2}:\d{2}\s*", "", m_alt.group(1)).strip()
-                maker = m_alt.group(2).strip()
-                title = raw_t
-            else:
-                tokens = [re.sub(r"^\d{1,2}:\d{2}\s*", "", seg).strip() for seg in re.split(r"[\r\n\t]+", body)]
+            # 1) サムネイル画像の "作品名 [サークル・出版社名]" パターンがあれば、行末の最後の [サークル名] から正確に分離
+            title = ""
+            maker = ""
+            for seg in re.split(r"[\r\n\t]+", body):
+                clean_seg = re.sub(r"^\d{1,2}[:：]\d{2}\s*", "", seg).strip()
+                if not clean_seg or re.match(r"^\d{1,2}[:：]\d{2}$", clean_seg):
+                    continue
+                m_alt = re.match(r"^(.+?)\s*\[([^\[\]]+)\]\s*$", clean_seg)
+                if m_alt:
+                    title = m_alt.group(1).strip()
+                    maker = m_alt.group(2).strip()
+                    break
+            if not title:
+                tokens = [re.sub(r"^\d{1,2}[:：]\d{2}\s*", "", seg).strip() for seg in re.split(r"[\r\n\t]+", body)]
                 tokens = [seg for seg in tokens if seg and seg != "-" and not re.match(r"^\d{1,2}[:：]\d{2}$", seg)]
                 title = tokens[0] if len(tokens) > 0 else ""
                 maker = tokens[1] if len(tokens) > 1 else ""
@@ -1216,29 +1222,30 @@ with tab3:
     BULK_COLS = ["処理区分"] + COLUMNS
     if "bulk_df" not in st.session_state or list(st.session_state.bulk_df.columns) != BULK_COLS:
         st.session_state.bulk_df = pd.DataFrame(columns=BULK_COLS)
-    if "input_ver" not in st.session_state:
-        st.session_state.input_ver = 0
     if "editor_ver" not in st.session_state:
         st.session_state.editor_ver = 0
     if "bulk_flash_msg" in st.session_state and st.session_state.bulk_flash_msg:
         st.success(st.session_state.bulk_flash_msg)
         st.session_state.bulk_flash_msg = ""
 
-    iv = st.session_state.input_ver
+    source_mode = st.radio(
+        "読み込むサイト・入力方法を選択（抽出ボタンを押しても選択中のサイトから切り替わりません）",
+        [
+            "🎧 方法A：DLsite（購入履歴 / 本棚）",
+            "🔞 方法B：FANZA / DMM（購入済み一覧）",
+            "📦 方法C：Amazon Kindle（コンテンツ管理）",
+            "✍️ 方法D：手入力・その他（1行1作品）"
+        ],
+        horizontal=True,
+        key="bulk_source_mode"
+    )
 
-    sub_a, sub_b, sub_c, sub_d = st.tabs([
-        "🎧 方法A：DLsite（購入履歴 / 本棚）",
-        "🔞 方法B：FANZA / DMM（購入済み一覧）",
-        "📦 方法C：Amazon Kindle（コンテンツ管理）",
-        "✍️ 方法D：手入力・その他（1行1作品）"
-    ])
-
-    with sub_a:
+    if source_mode.startswith("🎧"):
         rj_text = st.text_area(
             "DLsiteの購入履歴画面（Ctrl+Aで丸ごとコピーしたもの）、またはRJ/BJ番号リストを貼り付け",
-            placeholder="・購入履歴ページの画面全体（Ctrl+A -> Ctrl+C）をそのまま貼り付けOK！\n・サムネイル文字（作品名 [サークル名]）からタイトルとサークル名を自動分離し、タブ区切り内の『792円』などの金額もすべて自動抽出します。\n・抽出成功時にこの入力欄は自動でクリアされます。",
+            placeholder="・購入履歴ページの画面全体（Ctrl+A -> Ctrl+C）をそのまま貼り付けOK！\n・タイトル途中に [...] があっても行末の [サークル名] だけを正確に分離し、金額もすべて自動抽出します。",
             height=140,
-            key=f"dl_text_{iv}"
+            key="dl_text_input"
         )
         col_d1, col_d2 = st.columns(2)
         with col_d1:
@@ -1246,7 +1253,7 @@ with tab3:
         with col_d2:
             dlsite_date = st.date_input("購入日（日付が取得できない場合用）", value=date.today(), key="dl_date")
 
-        if st.button("① DLsiteテキストから作品・金額・年齢区分を自動抽出"):
+        if st.button("① DLsiteテキストから作品・金額・年齢区分を自動抽出", type="primary"):
             age_override = "自動判別"
             if "すべて全年齢" in dlsite_age_mode:
                 age_override = "全年齢"
@@ -1267,71 +1274,63 @@ with tab3:
                 prog.empty()
                 annotated_rows = annotate_bulk_actions(df, new_rows)
                 st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(annotated_rows)], ignore_index=True)
-                st.session_state.input_ver += 1
                 st.session_state.editor_ver += 1
-                st.session_state.bulk_flash_msg = f"DLsiteから {len(annotated_rows)} 件の作品情報をプレビュー表に追加し、テキスト欄をクリアしました！"
-                st.rerun()
+                st.success(f"DLsiteから {len(annotated_rows)} 件の作品情報を下のプレビュー表に追加しました！")
             else:
                 parsed_rows = parse_dlsite_copied_text(rj_text, dlsite_date.strftime("%Y/%m/%d"), default_age=age_override)
                 if parsed_rows:
                     annotated_rows = annotate_bulk_actions(df, parsed_rows)
                     st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(annotated_rows)], ignore_index=True)
-                    st.session_state.input_ver += 1
                     st.session_state.editor_ver += 1
-                    st.session_state.bulk_flash_msg = f"DLsiteのテキストから {len(annotated_rows)} 件（金額・年齢区分・重複判定付き）をプレビュー表に追加し、テキスト欄をクリアしました！"
-                    st.rerun()
+                    st.success(f"DLsiteのテキストから {len(annotated_rows)} 件（金額・年齢区分・重複判定付き）を下のプレビュー表に追加しました！")
                 else:
                     st.warning("作品データを抽出できませんでした。購入履歴ページでコピーしたテキストが入っているか確認してください。")
 
-    with sub_b:
+    elif source_mode.startswith("🔞"):
         fanza_text = st.text_area(
             "FANZA / DMMの購入済み一覧でコピーしたテキスト（日付・コミック/ボイス/ゲーム・作品名・サークル名）を貼り付け",
             placeholder="例:\n2026年08月24日\nコミック\n愛が重すぎる彼女達に温泉旅館に缶詰にされた時の話\n全角14字",
             height=140,
-            key=f"fz_text_{iv}"
+            key="fz_text_input"
         )
         col_fz1, col_fz2 = st.columns(2)
         with col_fz1:
             fanza_plat = st.selectbox("購入元の選択（FANZA=R-18 / DMM=全年齢）", ["FANZA", "DMM"], key="fz_plat")
         with col_fz2:
             fanza_date = st.date_input("購入日（日付行がない場合用）", value=date.today(), key="fz_date")
-        if st.button("① FANZA/DMMテキストから作品を自動抽出"):
+        if st.button("① FANZA/DMMテキストから作品を自動抽出", type="primary"):
             fz_rows = parse_fanza_dmm_text(fanza_text, fanza_date.strftime("%Y/%m/%d"), platform_name=fanza_plat)
             if fz_rows:
                 annotated_rows = annotate_bulk_actions(df, fz_rows)
                 st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(annotated_rows)], ignore_index=True)
-                st.session_state.input_ver += 1
                 st.session_state.editor_ver += 1
-                st.session_state.bulk_flash_msg = f"{fanza_plat}の画面コピーから {len(annotated_rows)} 件の作品をプレビュー表に追加し、テキスト欄をクリアしました！"
-                st.rerun()
+                st.success(f"{fanza_plat}の画面コピーから {len(annotated_rows)} 件の作品を下のプレビュー表に追加しました！")
             else:
                 st.warning("作品を抽出できませんでした。「コミック」「ボイス」「ゲーム」などの種別行が含まれているか確認してください。")
 
-    with sub_c:
+    elif source_mode.startswith("📦"):
         amz_text = st.text_area(
             "Amazonの「コンテンツと端末の管理（本の一覧）」で画面全体（Ctrl+A -> Ctrl+C）をコピーしたテキストを貼り付け",
             placeholder="・Amazonの「コンテンツと端末の管理」の画面全体をCtrl+A -> Ctrl+Cでコピーしてそのままペースト！",
             height=140,
-            key=f"amz_text_{iv}"
+            key="amz_text_input"
         )
         col_am1, col_am2 = st.columns(2)
         with col_am1:
             amz_type = st.selectbox("一括設定する種別", ["漫画", "小説", "その他"], key="amz_type_select")
         with col_am2:
             amz_age = st.selectbox("一括設定する年齢区分", ["全年齢", "R-18"], key="amz_age_select")
-        if st.button("① Amazonテキストから作品・巻数情報を自動抽出"):
+        if st.button("① Amazonテキストから作品・巻数情報を自動抽出", type="primary"):
             amz_rows = parse_amazon_kindle_text(amz_text, fallback_type=amz_type, default_age=amz_age)
             if amz_rows:
                 annotated_rows = annotate_bulk_actions(df, amz_rows)
                 st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(annotated_rows)], ignore_index=True)
-                st.session_state.input_ver += 1
                 st.session_state.editor_ver += 1
-                st.session_state.bulk_flash_msg = f"Amazonの画面コピーから {len(annotated_rows)} 件のシリーズをプレビュー表に追加し、テキスト欄をクリアしました！"
-                st.rerun()
+                st.success(f"Amazonの画面コピーから {len(annotated_rows)} 件のシリーズを下のプレビュー表に追加しました！")
             else:
                 st.warning("Amazonの購入データを抽出できませんでした。「取得日: ○年○月○日」を含むテキストが入っているか確認してください。")
 
-    with sub_d:
+    else:
         col_b0, col_b1, col_b2, col_b3, col_b4 = st.columns(5)
         with col_b0:
             bulk_age = st.selectbox("年齢区分", ["全年齢", "R-18"], key="b_age")
@@ -1348,9 +1347,9 @@ with tab3:
             "1行に1作品のタイトルを入力（『タイトル, 所持巻数, 作者名, 金額』のようにカンマやタブで区切ると同時に入ります）",
             placeholder="例:\n〇〇の冒険, 1〜5, 山田太郎, 2500\n△△の日常, 1〜3(特装), 佐藤花子, 1800",
             height=130,
-            key=f"lines_text_{iv}"
+            key="lines_text_input"
         )
-        if st.button("① 下のプレビュー表に追加"):
+        if st.button("① 下のプレビュー表に追加", type="primary"):
             lines = [line.strip() for line in lines_text.splitlines() if line.strip()]
             if not lines:
                 st.warning("テキストを入力してください。")
@@ -1379,12 +1378,10 @@ with tab3:
                     })
                 annotated_rows = annotate_bulk_actions(df, added_rows)
                 st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(annotated_rows)], ignore_index=True)
-                st.session_state.input_ver += 1
                 st.session_state.editor_ver += 1
-                st.session_state.bulk_flash_msg = f"{len(annotated_rows)}件を下のプレビュー表に追加し、テキスト欄をクリアしました！"
-                st.rerun()
+                st.success(f"{len(annotated_rows)}件を下のプレビュー表に追加しました！")
 
-    st.subheader("登録前の確認・編集プレビュー表")
+    st.subheader(f"登録前の確認・編集プレビュー表（現在 {len(st.session_state.bulk_df)} 件）")
     st.caption("左端の「処理区分」で、既存行への上書き補完（🔄）になるか新規追加（✨/🎨/⚠️）になるかを事前に確認・変更できます。")
     edited_df = st.data_editor(
         st.session_state.bulk_df,
@@ -1426,7 +1423,6 @@ with tab3:
                             ins_c = res_json.get("inserted", 0)
                             upd_c = res_json.get("updated", 0)
                             st.session_state.bulk_df = pd.DataFrame(columns=BULK_COLS)
-                            st.session_state.input_ver += 1
                             st.session_state.editor_ver += 1
                             st.session_state.bulk_flash_msg = f"✅ 完了！ 新規追加: {ins_c} 件 ／ 既存行の上書き補完: {upd_c} 件 を反映し、プレビュー表をクリアしました！"
                             st.cache_data.clear()
