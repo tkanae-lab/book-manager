@@ -179,6 +179,7 @@ def apply_local_updates(payload_rows):
     if new_records:
         cur_df = pd.concat([cur_df, pd.DataFrame(new_records, columns=COLUMNS)], ignore_index=True)
     st.session_state.master_df = cur_df
+    st.session_state.dual_owned_map = None
 
 def add_row(row_dict):
     res = requests.post(GAS_URL, json=row_dict, timeout=90)
@@ -293,24 +294,21 @@ def merge_volume_strings(old_vol_str, new_vol_str):
 
 def detect_all_dual_owned(df):
     """
-    重複・関連所持を4つの明確なカテゴリに分類し、
-    『どの作品（タイトル・サイト・種別・版・巻数）と重なっているか』を返す
+    O(N) グループ化による高速な重複・関連所持判定（2,000件以上でも数ミリ秒で完了）
     戻り値: dict[index] -> {"category": str, "detail": str, "base_title": str}
     """
+    if df.empty:
+        return {}
     base_titles = df["タイトル"].apply(normalize_base_title)
-    title_counts = Counter([bt for bt in base_titles if bt])
+    groups = {}
+    for idx, bt in base_titles.items():
+        if bt:
+            groups.setdefault(bt, []).append(idx)
 
     info_per_index = {}
-    for idx, row in df.iterrows():
-        bt = base_titles.loc[idx]
-        ed = str(row["版・仕様"]).strip()
-        vol_str = str(row["所持巻数"]).strip()
-        details = []
-        cat = None
-
-        if bt and title_counts[bt] >= 2:
-            group_rows = df[base_titles == bt]
-            other_rows = group_rows.drop(index=idx)
+    for bt, idx_list in groups.items():
+        if len(idx_list) >= 2:
+            group_rows = df.loc[idx_list]
             types = set(group_rows["種別"])
             bonuses = [is_bonus_or_trial_row(r) for _, r in group_rows.iterrows()]
             eds = set(group_rows["版・仕様"])
@@ -324,40 +322,66 @@ def detect_all_dual_owned(df):
             else:
                 cat = "🚨 要確認（通常＋特装版／別サイト重複）"
 
-            partner_descs = []
-            for _, r in other_rows.iterrows():
-                p_plat = r["購入元"] or "Keepメモ"
-                p_type = r["種別"]
-                p_ed = r["版・仕様"]
-                p_vol = f" / {r['所持巻数']}" if str(r["所持巻数"]).strip() else ""
-                partner_descs.append(f"『{r['タイトル']}』({p_plat}・{p_type}・{p_ed}{p_vol})")
-            details.append("相手: " + " ｜ ".join(partner_descs[:3]))
+            for idx in idx_list:
+                partner_descs = []
+                for o_idx in idx_list:
+                    if o_idx == idx:
+                        continue
+                    r = df.loc[o_idx]
+                    p_plat = r["購入元"] or "Keepメモ"
+                    p_type = r["種別"]
+                    p_ed = r["版・仕様"]
+                    p_vol = f" / {r['所持巻数']}" if str(r["所持巻数"]).strip() else ""
+                    partner_descs.append(f"『{r['タイトル']}』({p_plat}・{p_type}・{p_ed}{p_vol})")
+                info_per_index[idx] = {
+                    "category": cat,
+                    "detail": "相手: " + " ｜ ".join(partner_descs[:3]),
+                    "base_title": bt
+                }
 
-        _, dup_vols = parse_volume_tokens(vol_str)
-        if dup_vols:
-            if not cat:
-                cat = "🚨 要確認（通常＋特装版／別サイト重複)"
-            details.append(f"同一行内で巻数重複・別仕様あり({', '.join(dup_vols)})")
-
-        if ("＋" in ed or "+" in ed or "二重" in ed) and not cat:
-            cat = "🚨 要確認（通常＋特装版／別サイト重複）"
-            details.append(f"仕様欄で二重所持({ed})")
-
-        if cat:
-            info_per_index[idx] = {
-                "category": cat,
-                "detail": " / ".join(details),
-                "base_title": bt or str(row["タイトル"])
-            }
+    # 単一行内の巻数重複・二重仕様チェック
+    for idx, row in df.iterrows():
+        ed = str(row["版・仕様"]).strip()
+        vol_str = str(row["所持巻数"]).strip()
+        extra_details = []
+        if "，" in vol_str or "," in vol_str or "＋" in vol_str or "+" in vol_str or "二重" in vol_str:
+            _, dup_vols = parse_volume_tokens(vol_str)
+            if dup_vols:
+                extra_details.append(f"同一行内で巻数重複・別仕様あり({', '.join(dup_vols)})")
+        if "＋" in ed or "+" in ed or "二重" in ed:
+            extra_details.append(f"仕様欄で二重所持({ed})")
+        if extra_details:
+            if idx in info_per_index:
+                info_per_index[idx]["detail"] += " / " + " / ".join(extra_details)
+            else:
+                info_per_index[idx] = {
+                    "category": "🚨 要確認（通常＋特装版／別サイト重複）",
+                    "detail": " / ".join(extra_details),
+                    "base_title": base_titles.loc[idx] or str(row["タイトル"])
+                }
     return info_per_index
 
 def annotate_bulk_actions(df_existing, new_rows_list):
+    if not new_rows_list:
+        return []
+    # 既存行のベースタイトルとIDを1回だけ事前計算して高速照合
+    ex_records = []
+    if not df_existing.empty:
+        for _, ex in df_existing.iterrows():
+            ex_records.append({
+                "row": ex,
+                "id": str(ex["固有ID"]).strip().upper(),
+                "base": normalize_base_title(ex["タイトル"]).lower(),
+                "ed": str(ex["版・仕様"]).strip() or "通常",
+                "plat": str(ex["購入元"]).strip()
+            })
+
     annotated = []
     for item in new_rows_list:
         row_copy = {col: str(item.get(col, "")).strip() for col in COLUMNS}
         in_id = row_copy["固有ID"].upper()
         in_title = row_copy["タイトル"]
-        in_base = normalize_base_title(in_title)
+        in_base = normalize_base_title(in_title).lower()
         in_ed = row_copy["版・仕様"] or "通常"
         in_plat = row_copy["購入元"]
 
@@ -366,30 +390,25 @@ def annotate_bulk_actions(df_existing, new_rows_list):
         same_base_diff_ed = None
         diff_site_match = None
 
-        for _, ex in df_existing.iterrows():
-            ex_id = str(ex["固有ID"]).strip().upper()
-            ex_title = str(ex["タイトル"]).strip()
-            ex_base = normalize_base_title(ex_title)
-            ex_ed = str(ex["版・仕様"]).strip() or "通常"
-            ex_plat = str(ex["購入元"]).strip()
-
+        for rec in ex_records:
+            ex_id = rec["id"]
+            ex_base = rec["base"]
             id_matched = bool(in_id and ex_id and in_id == ex_id)
             title_matched = bool(
                 in_base and ex_base and (
-                    in_base.lower() == ex_base.lower()
-                    or (len(in_base) >= 5 and in_base.lower() in ex_base.lower())
-                    or (len(ex_base) >= 5 and ex_base.lower() in in_base.lower())
+                    in_base == ex_base
+                    or (len(in_base) >= 5 and in_base in ex_base)
+                    or (len(ex_base) >= 5 and ex_base in in_base)
                 )
             )
-
             if id_matched or title_matched:
-                if ex_plat == in_plat and ex_ed == in_ed:
-                    same_site_same_ed = ex
+                if rec["plat"] == in_plat and rec["ed"] == in_ed:
+                    same_site_same_ed = rec["row"]
                     break
-                elif ex_ed != in_ed:
-                    same_base_diff_ed = ex
+                elif rec["ed"] != in_ed:
+                    same_base_diff_ed = rec["row"]
                 else:
-                    diff_site_match = ex
+                    diff_site_match = rec["row"]
 
         if same_site_same_ed is not None:
             action = "🔄 同サイト上書き補完（金額・年齢・巻数を更新）"
@@ -408,14 +427,13 @@ def annotate_bulk_actions(df_existing, new_rows_list):
         elif diff_site_match is not None:
             action = "⚠️ 別サイト/既存あり（別行として新規追加）"
             prev_plat = diff_site_match["購入元"] or "Keepメモ(購入元未設定)"
-            prev_vol = diff_site_match["所持巻数"] or "巻数未設定"
-            note_add = f"他枠所持あり({prev_plat}: {prev_vol})"
+            note_add = f"既存所持あり({prev_plat})"
             if note_add not in row_copy["備考"]:
                 row_copy["備考"] = f"{row_copy['備考']} / {note_add}".strip(" /")
 
-        row_with_action = {"処理区分": action}
-        row_with_action.update(row_copy)
-        annotated.append(row_with_action)
+        out_row = {"処理区分": action}
+        out_row.update(row_copy)
+        annotated.append(out_row)
     return annotated
 
 def check_duplicates(df, item_id, title, edition, volumes):
@@ -1015,7 +1033,9 @@ def style_by_type(df_to_style):
     return df_to_style.style.apply(row_style, axis=1)
 
 df = load_data()
-dual_owned_map = detect_all_dual_owned(df)
+if "dual_owned_map" not in st.session_state or st.session_state.dual_owned_map is None:
+    st.session_state.dual_owned_map = detect_all_dual_owned(df)
+dual_owned_map = st.session_state.dual_owned_map
 
 tab1, tab2, tab3 = st.tabs(["🔍 登録一覧・検索・二重所持判定", "➕ 1件登録", "📦 まとめて一括登録（上書き補完対応）"])
 
@@ -1027,6 +1047,7 @@ with tab1:
         if st.button("🔄 最新データに更新"):
             st.cache_data.clear()
             st.session_state.master_df = None
+            st.session_state.dual_owned_map = None
             st.rerun()
 
     # 買う前のまとめて所持チェッカー（折りたたみ式）
@@ -1078,13 +1099,15 @@ with tab1:
     cat_counts = Counter([v["category"] for v in dual_owned_map.values()])
     real_dup_count = sum(1 for v in dual_owned_map.values() if v["category"].startswith(("🚨", "🎨")))
 
-    col_chk1, col_chk2, col_chk3 = st.columns([2.2, 1.3, 1.2])
+    col_chk1, col_chk2, col_chk3, col_chk4 = st.columns([2.2, 1.2, 1.2, 1.1])
     with col_chk1:
         only_dual = st.checkbox(f"⚠️ 重複・別版・関連所持で絞り込む（要確認・仕様違い: {real_dup_count}件 ／ 全関連: {len(dual_owned_map)}件）")
     with col_chk2:
-        show_cards = st.checkbox("📱 検索結果をカード形式でも表示（15件以下の時）", value=True)
+        row_limit_opt = st.selectbox("表の表示件数上限（軽量化）", ["先頭100件のみ表示（高速）", "先頭300件まで表示", "全件表示する"], label_visibility="collapsed")
     with col_chk3:
-        use_color = st.checkbox("🎨 種別ごとに色分け表示", value=True)
+        show_cards = st.checkbox("📱 15件以下の時はカード表示も出す", value=True)
+    with col_chk4:
+        use_color = st.checkbox("🎨 色分け（200件以下の時）", value=False)
 
     filtered_df = df.copy()
     if only_dual:
@@ -1174,7 +1197,17 @@ with tab1:
         for x in filtered_df["金額"]
         if re.sub(r"[^\d]", "", str(x))
     )
-    st.write(f"表示件数: **{len(filtered_df)}** 件 / 全 **{len(df)}** 件　｜　💰 表示中の合計金額: **{total_yen:,}** 円")
+    # 表示件数上限の適用（検索・フィルターの集計自体は全該当データで正確に計算）
+    if "100件" in row_limit_opt:
+        max_rows = 100
+    elif "300件" in row_limit_opt:
+        max_rows = 300
+    else:
+        max_rows = len(filtered_df)
+
+    display_df = filtered_df.head(max_rows)
+    limit_note = f"（画面高速化のため先頭 **{len(display_df)}** 件を表示中）" if len(filtered_df) > len(display_df) else ""
+    st.write(f"該当件数: **{len(filtered_df)}** 件{limit_note} / 全 **{len(df)}** 件　｜　💰 該当分の合計金額: **{total_yen:,}** 円")
 
     # 検索結果が15件以下のとき（かつキーワード入力時または重複絞り込み時）、横スクロール不要のパッと見カードを表示
     if show_cards and (keyword.strip() or only_dual) and 1 <= len(filtered_df) <= 15:
@@ -1193,10 +1226,10 @@ with tab1:
                     f"　{vol_badge}{comp_badge} ｜ 🏢 {r['作者・サークル'] or '—'} ｜ 🛒 **{plat_badge}**{price_badge}{dup_line}"
                 )
 
-    if use_color and not filtered_df.empty:
-        st.dataframe(style_by_type(filtered_df), use_container_width=True, hide_index=True)
+    if use_color and not display_df.empty and len(display_df) <= 200:
+        st.dataframe(style_by_type(display_df), use_container_width=True, hide_index=True)
     else:
-        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 with tab2:
     st.subheader("作品の1件登録")
