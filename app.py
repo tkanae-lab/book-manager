@@ -200,7 +200,7 @@ def normalize_base_title(title):
 def normalize_for_search(s):
     """検索用：全角半角・大文字小文字・記号・スペースの揺れを吸収した文字列を返す"""
     t = unicodedata.normalize("NFKC", str(s)).lower()
-    t = re.sub(r"[\s\u3000×x✕・〜~～\-－―_!！?？:：/／「」『』【】\[\]()（）,、.。・…]+", "", t)
+    t = re.sub(r"[\s\u3000×x✕・〜~～\-－―—_!！?？:：/／「」『』【】\[\]()（）,、.。・…]+", "", t)
     return t
 
 def is_bonus_or_trial_row(row):
@@ -920,6 +920,64 @@ def parse_fanza_dmm_text(text, fallback_date, platform_name="FANZA"):
         return []
     return consolidate_series_rows(raw_items, platform_name)
 
+def clean_amazon_title_and_vol(raw_title):
+    t = str(raw_title).strip()
+    # 1) 末尾の (Japanese Edition) を除去
+    t = re.sub(r"\s*[\(（]\s*Japanese\s+Edition\s*[\)）]\s*$", "", t, flags=re.IGNORECASE).strip()
+
+    # 2) 末尾の（ヤングマガジンコミックス）等のレーベル括弧を抽出して備考へ回す
+    label_str = ""
+    while True:
+        m_lbl = re.search(
+            r"\s*[\(（]([^\(（）\)]*(?:コミックス|コミック|マガジン|ジャンプ|サンデー|チャンピオン|ガンガン|シリウス|アフタヌーン|モーニング|イブニング|スピリッツ|スペリオール|フラッパー|アライブ|電撃|文庫|ノベル|ブックス|Web|Ｗｅｂ|DIGITAL|デジタル|出版|社|書房|書店|レーベル|KC|JC|YJ|YM)[^\(（）\)]*)[\)）]\s*$",
+            t, re.IGNORECASE
+        )
+        if m_lbl:
+            lbl_cand = unicodedata.normalize("NFKC", m_lbl.group(1)).strip()
+            if not re.match(r"^\d+$", lbl_cand):
+                label_str = lbl_cand if not label_str else f"{lbl_cand} / {label_str}"
+                t = t[:m_lbl.start()].strip()
+                continue
+        break
+
+    t_norm_digits = t.translate(str.maketrans("０１２３４５６７８９（）", "0123456789()"))
+    v_num = None
+    base_t = t
+
+    # 3) "DARKNESS HEELS ―Lili― 1 DARKNESS HEELS -Lili-" のように巻数の前後に同じシリーズ名が繰り返されるパターン
+    m_rep = re.match(r"^(.+?)\s+(\d{1,3})\s+(.+)$", t_norm_digits)
+    if m_rep:
+        left_part = m_rep.group(1).strip()
+        num_part = int(m_rep.group(2))
+        right_part = m_rep.group(3).strip()
+        if normalize_for_search(left_part) and normalize_for_search(left_part) == normalize_for_search(right_part):
+            v_num = num_part
+            base_t = left_part
+
+    # 4) 括弧付きの巻数: （１４）, (5) など
+    if v_num is None:
+        m_vol = re.search(r"\s*[\(（](\d{1,3})[\)）]\s*$", t_norm_digits)
+        if not m_vol:
+            m_vol = re.search(r"[\(（](\d{1,3})[\)）]", t_norm_digits)
+        if m_vol:
+            v_num = int(m_vol.group(1))
+            base_t = (t[:m_vol.start()] + t[m_vol.end():]).strip()
+
+    # 5) "第○巻" / "○巻" または末尾のスペース区切り数字 ("一緒に暮らしていいですか？ 7")
+    if v_num is None:
+        m_vol2 = re.search(r"(?:第\s*)?(\d{1,3})\s*巻\s*$", t_norm_digits)
+        if m_vol2:
+            v_num = int(m_vol2.group(1))
+            base_t = t[:m_vol2.start()].strip()
+        else:
+            m_vol3 = re.search(r"\s+(\d{1,3})\s*$", t_norm_digits)
+            if m_vol3:
+                v_num = int(m_vol3.group(1))
+                base_t = t[:m_vol3.start()].strip()
+
+    base_t = re.sub(r"\u3000+", " ", base_t).strip()
+    return base_t, v_num, label_str
+
 def parse_amazon_kindle_text(text, fallback_type="漫画", default_age="全年齢"):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
@@ -932,73 +990,109 @@ def parse_amazon_kindle_text(text, fallback_type="漫画", default_age="全年�
         "コレクションに追加する", "すべて選択する", "すべての選択を解除",
         "表示:", "並べ替え:", "コンテンツを検索", "進む"
     ]
+    web_lib_junk = {
+        "kindle", "ライブラリ", "すべての作品", "本", "コミック", "サンプル",
+        "メモとハイライト", "フィルター", "表示", "並べ替え: 最近の読書または購入",
+        "並べ替え: タイトル", "並べ替え: 著者", "並べ替え"
+    }
 
     raw_items = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        m_date = date_pat.search(line)
-        if m_date:
-            d_str = f"{int(m_date.group(1)):04d}/{int(m_date.group(2)):02d}/{int(m_date.group(3)):02d}"
-            candidates = []
-            for back_idx in range(i - 1, max(-1, i - 5), -1):
-                prev_line = lines[back_idx]
-                if any(j in prev_line for j in junk_patterns) or date_pat.search(prev_line):
-                    break
-                candidates.insert(0, prev_line)
 
-            if len(candidates) >= 2:
-                title = candidates[0]
-                author = candidates[1]
-            elif len(candidates) == 1:
-                title = candidates[0]
-                author = ""
-            else:
-                title = ""
-                author = ""
+    # パターンA:「コンテンツと端末の管理」画面（取得日: ○年○月○日 がある形式）
+    if any(date_pat.search(l) for l in lines):
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            m_date = date_pat.search(line)
+            if m_date:
+                d_str = f"{int(m_date.group(1)):04d}/{int(m_date.group(2)):02d}/{int(m_date.group(3)):02d}"
+                candidates = []
+                for back_idx in range(i - 1, max(-1, i - 5), -1):
+                    prev_line = lines[back_idx]
+                    if any(j in prev_line for j in junk_patterns) or date_pat.search(prev_line):
+                        break
+                    candidates.insert(0, prev_line)
 
-            if title:
-                raw_items.append({
-                    "title": title,
-                    "author": author,
-                    "date": d_str
-                })
-        i += 1
+                if len(candidates) >= 2:
+                    title = candidates[0]
+                    author = candidates[1]
+                elif len(candidates) == 1:
+                    title = candidates[0]
+                    author = ""
+                else:
+                    title = ""
+                    author = ""
+
+                if title:
+                    raw_items.append({
+                        "title": title,
+                        "author": re.sub(r"\s*[;；]\s*", "・", author.strip()),
+                        "date": d_str
+                    })
+            i += 1
+
+    # パターンB:『Kindle Web版ライブラリ (read.amazon.co.jp)』コンパクトリスト形式（(Japanese Edition) 等）
+    else:
+        filtered_lines = [
+            l for l in lines
+            if l.lower() not in web_lib_junk and not l.startswith("並べ替え:") and not l.startswith("フィルター")
+        ]
+        i = 0
+        while i < len(filtered_lines):
+            line = filtered_lines[i]
+            # 1行にタブ区切りで「タイトル	著者」が入っている場合
+            if "\t" in line:
+                parts = [p.strip() for p in line.split("\t") if p.strip()]
+                if len(parts) >= 2:
+                    raw_items.append({
+                        "title": parts[0],
+                        "author": re.sub(r"\s*[;；]\s*", "・", parts[1]),
+                        "date": ""
+                    })
+                    i += 1
+                    continue
+
+            # 「タイトル行」＋「次の行が著者名」の2行ペア形式
+            if i + 1 < len(filtered_lines):
+                next_line = filtered_lines[i + 1]
+                # 次の行が別作品のタイトル（Japanese Edition付き）でなければ著者名としてペアにする
+                if not re.search(r"Japanese\s+Edition", next_line, re.IGNORECASE):
+                    raw_items.append({
+                        "title": line,
+                        "author": re.sub(r"\s*[;；]\s*", "・", next_line),
+                        "date": ""
+                    })
+                    i += 2
+                    continue
+
+            raw_items.append({
+                "title": line,
+                "author": "",
+                "date": ""
+            })
+            i += 1
 
     grouped = {}
     order_keys = []
 
     for it in raw_items:
-        t = it["title"].strip()
-        t_norm = t.translate(str.maketrans("０１２３４５６７８９（）", "0123456789()"))
-
-        m_vol = re.search(r"[\(（](\d+)[\)）]", t_norm)
-        v_num = None
-        if m_vol:
-            v_num = int(m_vol.group(1))
-            base_t = (t_norm[:m_vol.start()] + t_norm[m_vol.end():]).strip()
-        else:
-            m_vol2 = re.search(r"(\d+)\s*巻", t_norm)
-            if m_vol2:
-                v_num = int(m_vol2.group(1))
-                base_t = (t_norm[:m_vol2.start()] + t_norm[m_vol2.end():]).strip()
-            else:
-                base_t = t_norm
-
-        label_match = re.search(r"[\(（](.+?Web|.+?コミックス|.+?文庫|.+?レーベル)[\)）]", base_t, re.IGNORECASE)
-        label_str = ""
-        if label_match:
-            label_str = label_match.group(1)
-            base_t = (base_t[:label_match.start()] + base_t[label_match.end():]).strip()
+        base_t, v_num, label_str = clean_amazon_title_and_vol(it["title"])
+        if not base_t:
+            continue
+        author_clean = it["author"].strip()
 
         if v_num is not None:
-            key = (base_t, it["author"])
+            key = (base_t, author_clean)
             if key not in grouped:
                 grouped[key] = {"vols": [], "date": it["date"], "label": label_str}
                 order_keys.append(key)
             grouped[key]["vols"].append(v_num)
+            if not grouped[key]["label"] and label_str:
+                grouped[key]["label"] = label_str
+            if not grouped[key]["date"] and it["date"]:
+                grouped[key]["date"] = it["date"]
         else:
-            key = (base_t, it["author"], len(order_keys))
+            key = (base_t, author_clean, len(order_keys))
             grouped[key] = {"vols": [], "date": it["date"], "label": label_str, "exact_title": base_t}
             order_keys.append(key)
 
@@ -1025,6 +1119,46 @@ def parse_amazon_kindle_text(text, fallback_type="漫画", default_age="全年�
             "備考": g["label"]
         })
     return final_rows
+
+def merge_into_bulk_df(current_bulk_df, annotated_rows):
+    """
+    複数回に分けて抽出した際、プレビュー表（bulk_df）内に既に同じシリーズ（同タイトル・同購入元・同仕様）が
+    あれば行を増やさずに所持巻数と金額を自動で1行に合算・統合する
+    """
+    if current_bulk_df.empty:
+        return pd.DataFrame(annotated_rows)
+    res_df = current_bulk_df.copy()
+    new_to_append = []
+    for row in annotated_rows:
+        r_title = str(row.get("タイトル", "")).strip()
+        r_plat = str(row.get("購入元", "")).strip()
+        r_ed = str(row.get("版・仕様", "")).strip()
+        r_type = str(row.get("種別", "")).strip()
+        matched_idx = None
+        for idx, ex in res_df.iterrows():
+            if (
+                str(ex.get("タイトル", "")).strip() == r_title
+                and str(ex.get("購入元", "")).strip() == r_plat
+                and str(ex.get("版・仕様", "")).strip() == r_ed
+                and str(ex.get("種別", "")).strip() == r_type
+            ):
+                matched_idx = idx
+                break
+        if matched_idx is not None:
+            merged_vol = merge_volume_strings(res_df.at[matched_idx, "所持巻数"], row.get("所持巻数", ""))
+            res_df.at[matched_idx, "所持巻数"] = merged_vol
+            # 金額があれば合算
+            p1 = re.sub(r"[^\d]", "", str(res_df.at[matched_idx, "金額"]))
+            p2 = re.sub(r"[^\d]", "", str(row.get("金額", "")))
+            if p1 and p2:
+                res_df.at[matched_idx, "金額"] = str(int(p1) + int(p2))
+            elif p2:
+                res_df.at[matched_idx, "金額"] = p2
+        else:
+            new_to_append.append(row)
+    if new_to_append:
+        res_df = pd.concat([res_df, pd.DataFrame(new_to_append)], ignore_index=True)
+    return res_df
 
 def style_by_type(df_to_style):
     def row_style(row):
@@ -1336,7 +1470,7 @@ with tab3:
                     info["年齢区分"] = age_override
                 new_rows.append(info)
             annotated_rows = annotate_bulk_actions(df, new_rows)
-            st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(annotated_rows)], ignore_index=True)
+            st.session_state.bulk_df = merge_into_bulk_df(st.session_state.bulk_df, annotated_rows)
             st.session_state.editor_ver += 1
             st.session_state["dl_text_input"] = ""
             st.session_state.bulk_flash_msg = f"DLsiteから {len(annotated_rows)} 件の作品情報をプレビュー表に追加し、入力欄をクリアしました！"
@@ -1344,7 +1478,7 @@ with tab3:
             parsed_rows = parse_dlsite_copied_text(raw_t, d_val.strftime("%Y/%m/%d"), default_age=age_override)
             if parsed_rows:
                 annotated_rows = annotate_bulk_actions(df, parsed_rows)
-                st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(annotated_rows)], ignore_index=True)
+                st.session_state.bulk_df = merge_into_bulk_df(st.session_state.bulk_df, annotated_rows)
                 st.session_state.editor_ver += 1
                 st.session_state["dl_text_input"] = ""
                 st.session_state.bulk_flash_msg = f"DLsiteのテキストから {len(annotated_rows)} 件（金額・年齢区分・重複判定付き）をプレビュー表に追加し、入力欄をクリアしました！"
@@ -1358,7 +1492,7 @@ with tab3:
         fz_rows = parse_fanza_dmm_text(raw_t, d_val.strftime("%Y/%m/%d"), platform_name=plat_val)
         if fz_rows:
             annotated_rows = annotate_bulk_actions(df, fz_rows)
-            st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(annotated_rows)], ignore_index=True)
+            st.session_state.bulk_df = merge_into_bulk_df(st.session_state.bulk_df, annotated_rows)
             st.session_state.editor_ver += 1
             st.session_state["fz_text_input"] = ""
             st.session_state.bulk_flash_msg = f"{plat_val}の画面コピーから {len(annotated_rows)} 件の作品をプレビュー表に追加し、入力欄をクリアしました！"
@@ -1372,7 +1506,7 @@ with tab3:
         amz_rows = parse_amazon_kindle_text(raw_t, fallback_type=t_val, default_age=a_val)
         if amz_rows:
             annotated_rows = annotate_bulk_actions(df, amz_rows)
-            st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(annotated_rows)], ignore_index=True)
+            st.session_state.bulk_df = merge_into_bulk_df(st.session_state.bulk_df, annotated_rows)
             st.session_state.editor_ver += 1
             st.session_state["amz_text_input"] = ""
             st.session_state.bulk_flash_msg = f"Amazonの画面コピーから {len(annotated_rows)} 件のシリーズをプレビュー表に追加し、入力欄をクリアしました！"
@@ -1413,7 +1547,7 @@ with tab3:
                 "備考": ""
             })
         annotated_rows = annotate_bulk_actions(df, added_rows)
-        st.session_state.bulk_df = pd.concat([st.session_state.bulk_df, pd.DataFrame(annotated_rows)], ignore_index=True)
+        st.session_state.bulk_df = merge_into_bulk_df(st.session_state.bulk_df, annotated_rows)
         st.session_state.editor_ver += 1
         st.session_state["lines_text_input"] = ""
         st.session_state.bulk_flash_msg = f"{len(annotated_rows)}件を下のプレビュー表に追加し、入力欄をクリアしました！"
