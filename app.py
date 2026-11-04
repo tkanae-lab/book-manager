@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import re
 import html
+import time
 import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from collections import Counter
@@ -116,24 +117,68 @@ def format_clean_date(val):
 
     return s
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
+def fetch_remote_data():
+    last_err = None
+    for attempt in range(2):
+        try:
+            res = requests.get(GAS_URL, timeout=90)
+            res.raise_for_status()
+            data = res.json()
+            df = pd.DataFrame(data, columns=COLUMNS)
+            for col in COLUMNS:
+                if col not in df.columns:
+                    df[col] = ""
+            df = df[COLUMNS].fillna("").astype(str)
+            df = df[~((df["タイトル"] == "タイトル") & (df["固有ID"] == "固有ID"))].reset_index(drop=True)
+            df["版・仕様"] = df["版・仕様"].apply(lambda x: x if x.strip() else "通常")
+            df["購入日"] = df["購入日"].apply(format_clean_date)
+            return df
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(2)
+    raise last_err
+
 def load_data():
-    try:
-        res = requests.get(GAS_URL, timeout=30)
-        res.raise_for_status()
-        data = res.json()
-        df = pd.DataFrame(data, columns=COLUMNS)
-        for col in COLUMNS:
-            if col not in df.columns:
-                df[col] = ""
-        df = df[COLUMNS].fillna("").astype(str)
-        df = df[~((df["タイトル"] == "タイトル") & (df["固有ID"] == "固有ID"))].reset_index(drop=True)
-        df["版・仕様"] = df["版・仕様"].apply(lambda x: x if x.strip() else "通常")
-        df["購入日"] = df["購入日"].apply(format_clean_date)
-        return df
-    except Exception as e:
-        st.error(f"データの読み込みに失敗しました: {e}")
-        return pd.DataFrame(columns=COLUMNS)
+    if "master_df" not in st.session_state or st.session_state.master_df is None:
+        try:
+            st.session_state.master_df = fetch_remote_data()
+        except Exception as e:
+            st.error(f"データの読み込みに失敗しました（少し待ってから『🔄 最新データに更新』を押してください）: {e}")
+            st.session_state.master_df = pd.DataFrame(columns=COLUMNS)
+    return st.session_state.master_df
+
+def apply_local_updates(payload_rows):
+    """書き込み成功後、わざわざGASへ全件再取得しに行かずメモリ上のmaster_dfを即座に更新してタイムアウトを防ぐ"""
+    if "master_df" not in st.session_state or st.session_state.master_df is None:
+        return
+    cur_df = st.session_state.master_df.copy()
+    new_records = []
+    for item in payload_rows:
+        mode = item.get("_action", "insert")
+        clean_row = {col: str(item.get(col, "")).strip() for col in COLUMNS}
+        clean_row["版・仕様"] = clean_row["版・仕様"] or "通常"
+        clean_row["購入日"] = format_clean_date(clean_row["購入日"])
+        if mode == "upsert":
+            in_base = normalize_base_title(clean_row["タイトル"]).lower()
+            in_plat = clean_row["購入元"]
+            in_ed = clean_row["版・仕様"]
+            matched_idx = None
+            for idx, ex in cur_df.iterrows():
+                ex_base = normalize_base_title(ex["タイトル"]).lower()
+                if ex_base and in_base and ex_base == in_base and ex["購入元"] == in_plat and ex["版・仕様"] == in_ed:
+                    matched_idx = idx
+                    break
+            if matched_idx is not None:
+                for col in COLUMNS:
+                    if clean_row[col]:
+                        cur_df.at[matched_idx, col] = clean_row[col]
+                continue
+        new_records.append(clean_row)
+    if new_records:
+        cur_df = pd.concat([cur_df, pd.DataFrame(new_records, columns=COLUMNS)], ignore_index=True)
+    st.session_state.master_df = cur_df
 
 def add_row(row_dict):
     res = requests.post(GAS_URL, json=row_dict, timeout=90)
@@ -981,6 +1026,7 @@ with tab1:
     with col_top2:
         if st.button("🔄 最新データに更新"):
             st.cache_data.clear()
+            st.session_state.master_df = None
             st.rerun()
 
     # 買う前のまとめて所持チェッカー（折りたたみ式）
@@ -1208,8 +1254,8 @@ with tab2:
                     try:
                         res_json = add_row(new_row)
                         if res_json.get("status") == "success":
+                            apply_local_updates([new_row])
                             st.success(f"『{title}』（{edition}）をスプレッドシートに登録しました！")
-                            st.cache_data.clear()
                         else:
                             st.error(f"保存エラー: {res_json}")
                     except Exception as e:
@@ -1481,10 +1527,10 @@ with tab3:
                         if res_json.get("status") == "success":
                             ins_c = res_json.get("inserted", 0)
                             upd_c = res_json.get("updated", 0)
+                            apply_local_updates(payload_rows)
                             st.session_state.bulk_df = pd.DataFrame(columns=BULK_COLS)
                             st.session_state.editor_ver += 1
                             st.session_state.bulk_flash_msg = f"✅ 完了！ 新規追加: {ins_c} 件 ／ 既存行の上書き補完: {upd_c} 件 を反映し、プレビュー表をクリアしました！"
-                            st.cache_data.clear()
                             st.rerun()
                         else:
                             st.error(f"保存エラー（プレビュー表は保持されています）: {res_json}")
